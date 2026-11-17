@@ -27,7 +27,6 @@ export class OperationalLogger {
     this.write(JSON.stringify({ timestamp: this.now().toISOString(), level, component, event, ...compact(context), detail: redact(context.detail ?? {}) }));
   }
 }
-
 function compact(context: OperationalLogContext): Omit<OperationalLogContext, 'detail'> {
   return Object.fromEntries(Object.entries({ taskId: context.taskId, nodeId: context.nodeId, instanceId: context.instanceId, agentId: context.agentId, version: context.version }).filter(([, value]) => value !== undefined));
 }
@@ -39,4 +38,3 @@ function redact(value: unknown, depth = 0): unknown {
   if (!value || typeof value !== 'object') return String(value);
   return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, nested]) => [key, /(?:api[_-]?key|authorization|password|secret|token|cookie)/i.test(key) ? '[REDACTED]' : redact(nested, depth + 1)]));
 }
-

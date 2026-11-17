@@ -10,7 +10,7 @@
     "test:protocol": "vitest run tests/contracts/agent-protocol.spec.ts",
     "protocol:export": "tsx packages/agent-protocol/scripts/export-json-schemas.ts",
     "console:build": "vite build --config apps/console/vite.config.ts",
-    "agent:validate": "./node_modules/.bin/tsx agents/ragflow-knowledge/src/validate-manifest.ts && ./node_modules/.bin/tsx agents/ppt-maker/src/self-check.ts && ./node_modules/.bin/tsx agents/web-research/src/self-check.ts && ./node_modules/.bin/tsx agents/quality-management/src/self-check.ts",
+    "agent:validate": "tsx agents/ragflow-knowledge/src/validate-manifest.ts && tsx agents/ppt-maker/src/self-check.ts && tsx agents/web-research/src/self-check.ts && tsx agents/quality-management/src/self-check.ts && tsx agents/document-analysis/src/self-check.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

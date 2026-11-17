@@ -1,6 +1,6 @@
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import type { AgentTerminalResult, TaskEnvelope } from '../../../packages/agent-protocol/src/index.js';
 import type { CodexRunner, CodexRuntimeStatus } from '../../../packages/codex-runtime/src/index.js';
@@ -52,8 +52,9 @@ function validateTargets(workspace: string, value: unknown): string[] {
   return value.map((candidate) => {
     if (typeof candidate !== 'string' || !candidate.trim() || isAbsolute(candidate)) throw new Error('Target paths must be non-empty relative paths.');
     const resolved = resolve(root, candidate);
-    if (!resolved.startsWith(`${root}/`) && resolved !== root) throw new Error('Target paths must stay inside the task workspace.');
-    return relative(root, resolved);
+    const taskRelativePath = relative(root, resolved);
+    if (taskRelativePath === '..' || taskRelativePath.startsWith(`..${sep}`) || isAbsolute(taskRelativePath)) throw new Error('Target paths must stay inside the task workspace.');
+    return taskRelativePath;
   });
 }
 function validateAssessment(value: Assessment): void {

@@ -22,4 +22,3 @@ export class TaskObservabilityMigration implements MigrationInterface {
     await queryRunner.query(`DROP TABLE IF EXISTS task_activity_events`);
   }
 }
-

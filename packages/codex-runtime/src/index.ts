@@ -54,12 +54,14 @@ export class CodexCliRunner implements CodexRunner {
       '--output-last-message', lastMessagePath,
     ];
     if (input.outputSchemaPath) args.push('--output-schema', input.outputSchemaPath);
-    args.push(input.prompt);
+    // File contents and multi-round context may exceed the OS limit of one argument.
+    args.push('-');
     let output: ProcessOutput;
     try {
       output = await runProcess(
         this.options.command ?? 'codex',
         args,
+        input.prompt,
         input.workspacePath,
         input.timeoutMs ?? this.options.defaultTimeoutMs,
         lastMessagePath,
@@ -100,11 +102,14 @@ async function writeLogs(workspacePath: string, output: ProcessOutput): Promise<
  * caller may still supply an explicit timeout for bounded work such as
  * planning, but content work has no implicit total-duration limit.
  */
-function runProcess(command: string, args: string[], cwd: string, timeoutMs: number | undefined, lastMessagePath: string, signal?: AbortSignal, onOutput?: (entry: { stream: 'stdout' | 'stderr'; chunk: string }) => void | Promise<void>, onStatus?: (status: CodexRuntimeStatus) => void | Promise<void>, statusIntervalMs = 10_000, onSearch?: (query: string) => void): Promise<ProcessOutput> {
+function runProcess(command: string, args: string[], prompt: string, cwd: string, timeoutMs: number | undefined, lastMessagePath: string, signal?: AbortSignal, onOutput?: (entry: { stream: 'stdout' | 'stderr'; chunk: string }) => void | Promise<void>, onStatus?: (status: CodexRuntimeStatus) => void | Promise<void>, statusIntervalMs = 10_000, onSearch?: (query: string) => void): Promise<ProcessOutput> {
   return new Promise((resolve, reject) => {
     signal?.throwIfAborted();
     const grouped = process.platform !== 'win32' && Boolean(signal);
-    const child = spawn(command, args, { cwd, detached: grouped, stdio: ['ignore', 'pipe', 'pipe'], env: codexEnvironment() });
+    const child = spawn(command, args, { cwd, detached: grouped, stdio: ['pipe', 'pipe', 'pipe'], env: codexEnvironment() });
+    let inputError: Error | undefined;
+    child.stdin.on('error', (error: Error) => { inputError = error; });
+    child.stdin.end(prompt, 'utf8');
     const startedAt = Date.now();
     let stdout = '';
     let stderr = '';
@@ -207,6 +212,7 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       exited = true;
       cleanup();
       if (signal?.aborted) reject(new CodexProcessError('Codex runtime was cancelled.', { stdout, stderr }));
+      else if (inputError && code === 0 && !finalOutputReady) reject(new CodexProcessError('Codex runtime did not receive the complete prompt.', { stdout, stderr }));
       else if (finalOutputReady) resolve({ stdout, stderr });
       else if (timedOut) reject(new CodexProcessError(`Codex runtime timed out after ${timeoutMs ?? 'the configured limit'}ms.`, { stdout, stderr }));
       else if (code === 0) resolve({ stdout, stderr });

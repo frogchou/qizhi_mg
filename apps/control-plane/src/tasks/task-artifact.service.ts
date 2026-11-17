@@ -2,7 +2,7 @@ import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, copyFile, lstat, mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
-import type { DataSource } from 'typeorm';
+import type { DataSource, EntityManager } from 'typeorm';
 
 import { TaskWorkspaceService } from './task-workspace.service.js';
 
@@ -92,8 +92,8 @@ export class TaskArtifactService {
     return rows.map(toRecord);
   }
 
-  public async openForDownload(taskId: string, artifactId: string): Promise<TaskArtifactRecord & { content: Buffer }> {
-    const rows = await this.dataSource.query<Array<Record<string, unknown>>>(`SELECT id, task_id, task_node_id, task_attempt_id, revision, original_path, storage_path, file_name, media_type, sha256, size_bytes, created_at FROM task_artifacts WHERE task_id=$1 AND id=$2`, [taskId, artifactId]);
+  public async openForDownload(taskId: string, artifactId: string, db:Pick<EntityManager,'query'>=this.dataSource): Promise<TaskArtifactRecord & { content: Buffer }> {
+    const rows = await db.query<Array<Record<string, unknown>>>(`SELECT id, task_id, task_node_id, task_attempt_id, revision, original_path, storage_path, file_name, media_type, sha256, size_bytes, created_at FROM task_artifacts WHERE task_id=$1 AND id=$2`, [taskId, artifactId]);
     if (!rows[0]) throw new NotFoundException('Artifact was not found for this task.');
     const record = toRecord(rows[0]);
     const taskRoot = this.workspaces.taskRoot(taskId);

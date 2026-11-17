@@ -9,7 +9,7 @@ type AgentRegistrar = {
 
 export type DiscoveryResult = {
   packagePath: string;
-  outcome: 'discovered' | 'failed';
+  outcome: 'discovered' | 'failed' | 'skipped';
   agentId?: string;
   version?: string;
   status?: string;
@@ -27,14 +27,14 @@ export class AgentPackageDiscoveryService {
     const entries = await readdir(this.config.root, { withFileTypes: true });
     const discovered: DiscoveryResult[] = [];
     for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
       const packagePath = join(this.config.root, entry.name);
       if (!existsSync(join(packagePath, 'agent.yaml'))) continue;
       try {
         const result = object(await this.registry.discover(packagePath, 'system'));
         discovered.push({
           packagePath,
-          outcome: 'discovered',
+          outcome: ['deleted','deleting'].includes(String(result.status)) ? 'skipped' : 'discovered',
           agentId: text(result.agentId),
           version: text(result.version),
           status: text(result.status),

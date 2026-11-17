@@ -35,4 +35,3 @@ export class StreamTicketService {
     for (const [ticket, record] of this.tickets) if (record.expiresAt <= now) this.tickets.delete(ticket);
   }
 }
-

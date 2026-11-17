@@ -32,10 +32,13 @@ async function main(): Promise<void> {
   const logger = app.get(OperationalLogger);
   const discoveryResults = await discovery.discoverAvailable();
   const failedPackages = discoveryResults.filter((result) => result.outcome === 'failed');
-  logger.info('agent_discovery', 'scan_completed', { detail: { discovered: discoveryResults.length - failedPackages.length, failed: failedPackages.length } });
+  logger.info('agent_discovery', 'scan_completed', { detail: { discovered: discoveryResults.filter(r=>r.outcome==='discovered').length,
+    skipped: discoveryResults.filter(r=>r.outcome==='skipped').length, failed: failedPackages.length } });
   for (const result of failedPackages) logger.warn('agent_discovery', 'package_failed', { detail: { packagePath: result.packagePath, reason: result.reason } });
   discovery.startWatching();
-  await app.get(RegistryService).synchronizeReadyCatalog();
+  const registry = app.get(RegistryService);
+  await registry.recoverVersionChanges();
+  await registry.synchronizeReadyCatalog();
   const stopping = await dataSource.query<Array<{ id: string }>>("SELECT id FROM tasks WHERE state='stopping'");
   for (const task of stopping) {
     try { await app.get(TaskService).stopTask(task.id); }

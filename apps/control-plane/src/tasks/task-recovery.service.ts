@@ -22,7 +22,7 @@ export class TaskRecoveryService {
     }
     const tasks = await this.dataSource.query<{ id: string }[]>(`SELECT id FROM tasks WHERE state IN ('planned','running') ORDER BY created_at`);
     for (const task of tasks) await this.scheduler.advance(task.id);
-    const planning = await this.dataSource.query<{ id: string }[]>(`SELECT id FROM tasks WHERE state IN ('received','planning') AND current_plan_version IS NULL ORDER BY created_at`);
+    const planning = await this.dataSource.query<{ id: string }[]>(`SELECT id FROM tasks WHERE state IN ('received','planning') ORDER BY created_at`);
     for (const task of planning) this.orchestration?.enqueue(task.id);
   }
 }

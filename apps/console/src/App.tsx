@@ -2,6 +2,9 @@ import { type ChangeEvent, type FormEvent, useCallback, useEffect, useMemo, useS
 
 import './task-activity.css';
 import './task-inputs.css';
+import './task-delivery.css';
+import { DeliveryBody } from './DeliveryBody';
+import type { TaskDelivery } from './lib/delivery-presenter';
 import { createTaskEventStream, type TaskStreamStatus } from './lib/task-event-stream';
 import { presentTask, stateName, stateTone, type TaskPresentation } from './lib/task-presenter';
 import { buildApiHeaders, type WorkflowStage } from './lib/workflow';
@@ -9,7 +12,7 @@ import { buildApiHeaders, type WorkflowStage } from './lib/workflow';
 type Task = { id: string; goal: string; state: string; acceptanceMode?: string; createdAt: string; updatedAt: string };
 type Agent = { agentId: string; displayName: string; version: string; status: string };
 type ReviewRound = {
-  id:string; round:number; decision:string|null;
+  id:string; round:number; decision:string|null; revision_number?:number;
   criteria:Array<{id:string;requirement:string;priority:string;basis:string}>;
   assessment:{items:Array<{id:string;status:string;reason:string;evidenceIds:string[]}>;reportedGaps:string[];error?:string;evidence:Array<{id:string;source:string;text:string}>};
 };
@@ -17,6 +20,8 @@ type TaskDetail = {
   acceptanceRounds?:ReviewRound[];
   task: Task & Record<string, unknown>;
   planSummary?: unknown;
+  delivery?: TaskDelivery;
+  revisions?: Array<Record<string, unknown>>;
   plans?: Array<Record<string, unknown>>;
   nodes: Array<Record<string, unknown>>;
   attempts: Array<Record<string, unknown>>;
@@ -154,7 +159,7 @@ export function App() {
         inputIds.push(uploaded.upload.id);
       }
       setUploadStatus(inputIds.length ? '正在冻结任务资料…' : '');
-      const task = await api<{ taskId: string }>('/v1/tasks', { method: 'POST', body: JSON.stringify({ goal: goal.trim(), acceptanceMode, inputIds }) });
+      const task = await api<{ taskId: string }>('/v1/tasks', { method: 'POST', body: JSON.stringify({ goal: goal.trim(), acceptanceMode, inputIds, sourceSystem:'console' }) });
       setGoal('');
       setInputFiles([]);
       setUploadStatus('');
@@ -291,7 +296,8 @@ export function ExecutionPanel({ detail, onSupplement, onStop, stopping, streamS
   const presentation = presentTask(detail, currentTime);
   const directAnswer = (detail.planSummary as { mode?: string } | undefined)?.mode === 'direct_answer';
   const canStop = ['received','planning','planned','running','awaiting_user_input','awaiting_review','stopping'].includes(presentation.state);
-  const review = detail.acceptanceRounds?.at(-1);
+  const revisionNumber = Number(detail.task.revision_number ?? detail.task.revisionNumber ?? 1);
+  const review = detail.acceptanceRounds?.filter(round => Number(round.revision_number ?? 1) === revisionNumber).at(-1);
   const canApprove = presentation.state === 'awaiting_review';
   const hasGaps = review && (review.assessment.error || review.assessment.reportedGaps.length || review.assessment.items.some(i=>i.status!=='met'));
   const canRework = canApprove && presentation.quality?.passed === false;
@@ -301,7 +307,15 @@ export function ExecutionPanel({ detail, onSupplement, onStop, stopping, streamS
       <div className="header-actions"><span className={`status-pill ${stateTone(presentation.state)}`}><Status state={presentation.state} />{presentation.stateLabel}</span>{canStop && <button className="outline-button" disabled={stopping} onClick={onStop}>{stopping ? '正在停止…' : presentation.state === 'stopping' ? '重试停止' : '停止任务'}</button>}{canApprove && <button className="primary-button" onClick={onApprove}>{(review || canRework) ? '接受当前答复' : '确认验收'}</button>}{canApprove && hasGaps ? <button className="outline-button" onClick={onSupplement}>带证据和缺项继续补查</button> : null}{canRework && <button className="outline-button" onClick={onRework}>根据质检意见返工</button>}</div>
     </header>
 
-    <section className="requirement-panel"><div className="section-title"><span>▣</span><h3>任务需求</h3><span className={`stream-status ${streamStatus}`}><i />实时连接 · {streamStatusName(streamStatus)}</span></div><p>{presentation.title}</p><div className="intent-summary"><strong>{directAnswer ? '中台答复' : '中台理解'}</strong>{!directAnswer && presentation.intent}<span style={{ whiteSpace: 'pre-line' }}>{presentation.summary}</span></div></section>
+    <section className="requirement-panel"><div className="section-title"><span>▣</span><h3>任务需求</h3><span className={`stream-status ${streamStatus}`}><i />实时连接 · {streamStatusName(streamStatus)}</span></div><p>{presentation.title}</p>{!directAnswer && <div className="intent-summary"><strong>中台理解</strong>{presentation.intent}<span style={{ whiteSpace: 'pre-line' }}>{presentation.summary}</span></div>}</section>
+
+    {(presentation.answers.length > 0 || detail.delivery !== undefined) && <section className="delivery-section" aria-label="交付正文">
+      <div className="section-title"><span>▤</span><h3>交付正文</h3></div>
+      {presentation.answers.length ? presentation.answers.map((answer, index) => <article className="delivery-answer" key={`${answer.nodeKey}-${index}`}>
+        <h4>{answer.title}</h4><DeliveryBody body={answer.body} format={answer.format} />
+        {!!answer.sources?.length && <div className="delivery-sources">{answer.sources.map(source => <p key={`${source.id}-${source.url}`}><a href={source.url} target="_blank" rel="noopener noreferrer">[{source.id}] {source.title}</a></p>)}</div>}
+      </article>) : <p className="empty-copy">{presentation.artifacts.length ? '本次交付以文件为主，请查看下方交付产物。' : '本轮暂无交付正文。'}</p>}
+    </section>}
 
     {review && <section className="requirement-panel"><h3>按原始需求验收 · 第 {review.round} 轮</h3>
       {review.assessment.error && <p>{review.assessment.error}</p>}
@@ -316,12 +330,6 @@ export function ExecutionPanel({ detail, onSupplement, onStop, stopping, streamS
       {review.decision && <p>{review.decision==='accept'?'管理员已接受本轮交付。':'管理员已要求带着本轮证据继续补查。'}</p>}
     </section>}
 
-    {presentation.nodes.filter(node => node.research).map(node => <section key={node.id} className="requirement-panel">
-      <div className="section-title"><h3>研究答复</h3><small>{node.research!.coverage === 'partial' ? '部分信息待核实' : node.research!.coverage === 'insufficient' ? '证据不足' : '已核对来源'}</small></div>
-      <p style={{whiteSpace:'pre-line'}}>{node.research!.summary}</p>
-      {node.research!.sources.map(source => <p key={source.id}><a href={source.url} target="_blank" rel="noopener noreferrer">[{source.id}] {source.title}</a></p>)}
-    </section>)}
-
     {presentation.state === 'awaiting_user_input' && presentation.interactions.filter((interaction) => interaction.state === 'pending').map((interaction) => <InteractionCard key={interaction.id} interaction={interaction} onRespond={onRespondInteraction} />)}
 
     <section className="flow-section"><div className="section-title"><span>⌘</span><h3>编排执行流程</h3><span className="task-runtime">{presentation.nodes.filter((node) => node.runtime === 'Codex 运行时').length ? '包含 Codex 运行时节点' : '原生运行时'}</span></div><div className="phase-flow">{presentation.stages.map((stage, index) => <PhaseStage key={stage.key} stage={stage} terminal={index === presentation.stages.length - 1} currentTime={currentTime} />)}</div></section>
@@ -330,11 +338,21 @@ export function ExecutionPanel({ detail, onSupplement, onStop, stopping, streamS
 
     <section className="activity-section"><div className="section-title"><span>◉</span><h3>实时执行时间线 <small>（{presentation.activities.length} 条活动）</small></h3></div>{presentation.activities.length ? <ol className="activity-timeline">{presentation.activities.map((activity, index) => <li key={activity.id || `${activity.kind}-${activity.occurredAt}`}><span className={`activity-dot ${stateTone(activity.state)}`} /><div className="activity-time"><time>{formatDate(activity.occurredAt)}</time><small>{timelineElapsed(presentation.activities[index - 1]?.occurredAt, activity.occurredAt)}</small></div><div className="activity-content"><strong>{activity.message}</strong><span>{sourceName(activity.source)} · {stateName(activity.state)}{activityDetail(activity.detail) ? ` · ${activityDetail(activity.detail)}` : ''}</span></div></li>)}</ol> : <p className="empty-copy wide">正在建立任务活动流；第一条后端活动会即时显示在这里。</p>}</section>
 
-    {!directAnswer && <section className="outcomes-section"><div className="section-title"><span>▱</span><h3>资料、产物与质量结果</h3></div><div className="outcome-grid"><article><h4>任务资料</h4>{presentation.inputs.length ? <ul className="artifact-list">{presentation.inputs.map((input) => <li key={input.id}><span>▤</span><div><strong>{input.displayName}</strong><small>任务私有 · {input.sourceType === 'uploaded_file' ? '本地附件' : input.sourceType} · {formatBytes(input.sizeBytes)}</small></div><button className="outline-button" onClick={() => onDownloadInput(input)}>下载</button></li>)}</ul> : <p>本任务未附加私有资料。后续可从知识库或栖知选择资料附加到任务。</p>}</article><article><h4>交付产物</h4>{presentation.artifacts.length ? <ul className="artifact-list">{presentation.artifacts.map((artifact) => <li key={artifact.id}><span>▣</span><div><strong>{artifact.fileName}</strong><small>第 {artifact.revision} 版 · {formatBytes(artifact.sizeBytes)}</small></div><button className="outline-button" onClick={() => onDownload(artifact)}>下载</button>{isPreviewable(artifact.mediaType) && <button className="text-button" onClick={() => onPreview(artifact)}>查看内容</button>}</li>)}</ul> : <p>产物将在相应智能体完成后出现。{presentation.deliverables.length ? ` 预期交付：${presentation.deliverables.join('、')}。` : ''}</p>}</article><article><h4>质量验收</h4>{presentation.quality ? <p><Status state={presentation.quality.passed === true ? 'accepted' : presentation.quality.passed === false ? 'failed' : presentation.quality.state} />{presentation.quality.summary}</p> : <p>质量智能体会在交付物生成后，依据本任务的验收标准进行检查。</p>}{canRework && <p>质检未通过，支持保留当前版本或带着质检意见返工。</p>}{presentation.risks.length > 0 && <ul className="risk-list">{presentation.risks.map((risk) => <li key={risk}>注意：{risk}</li>)}</ul>}</article></div></section>}
+    {!directAnswer && <section className="outcomes-section"><div className="section-title"><span>▱</span><h3>资料、产物与质量结果</h3></div><div className="outcome-grid">
+      <article><h4>任务资料</h4>{presentation.inputs.length ? <ul className="artifact-list">{presentation.inputs.map((input) => <li key={input.id}><span>▤</span><div><strong>{input.displayName}</strong><small>任务私有 · {input.sourceType === 'uploaded_file' ? '本地附件' : input.sourceType} · {formatBytes(input.sizeBytes)}</small></div><button className="outline-button" onClick={() => onDownloadInput(input)}>下载</button></li>)}</ul> : <p>本任务未附加私有资料。后续可从知识库或栖知选择资料附加到任务。</p>}</article>
+      <article><h4>交付产物</h4>{presentation.artifacts.length ? <ArtifactList artifacts={presentation.artifacts} onDownload={onDownload} onPreview={onPreview} /> : <p>{presentation.answers.length || ['completed', 'accepted', 'awaiting_review'].includes(presentation.state) ? '本轮没有可下载的交付文件。' : `交付文件将在相应智能体完成后出现。${presentation.deliverables.length ? ` 预期交付：${presentation.deliverables.join('、')}。` : ''}`}</p>}
+        {!!presentation.supportingArtifacts.length && <details className="supporting-artifacts"><summary>过程报告与参考文件（{presentation.supportingArtifacts.length}）</summary><p>执行与核验过程留档，可按需查看或下载。</p><ArtifactList artifacts={presentation.supportingArtifacts} onDownload={onDownload} onPreview={onPreview} /></details>}
+      </article>
+      <article><h4>质量验收</h4>{presentation.quality ? <p><Status state={presentation.quality.passed === true ? 'accepted' : presentation.quality.passed === false ? 'failed' : presentation.quality.state} />{presentation.quality.summary}</p> : <p>质量智能体会在交付物生成后，依据本任务的验收标准进行检查。</p>}{canRework && <p>质检未通过，支持保留当前版本或带着质检意见返工。</p>}{presentation.risks.length > 0 && <ul className="risk-list">{presentation.risks.map((risk) => <li key={risk}>注意：{risk}</li>)}</ul>}</article>
+    </div></section>}
 
     <details className="debug-panel"><summary><span>〈/〉</span>开发者调试信息 <small>统一执行事件、协议事件、无敏感令牌的尝试记录和结构化结果</small></summary><div className="debug-grid"><DebugBlock title="统一执行事件" value={presentation.debug.activities} /><DebugBlock title="智能体协议事件" value={presentation.debug.events} /><DebugBlock title="执行尝试" value={presentation.debug.attempts} /><DebugBlock title="节点结果" value={presentation.debug.nodeResults} /></div></details>
     {consoleOpen && <AgentConsole entries={presentation.consoleEntries} onClose={() => setConsoleOpen(false)} />}
   </section>;
+}
+
+function ArtifactList({ artifacts, onDownload, onPreview }: { artifacts: TaskPresentation['artifacts']; onDownload: (artifact: TaskPresentation['artifacts'][number]) => void; onPreview: (artifact: TaskPresentation['artifacts'][number]) => void }) {
+  return <ul className="artifact-list">{artifacts.map(artifact => <li key={artifact.id}><span>▣</span><div><strong>{artifact.fileName}</strong><small>第 {artifact.revision} 版 · {formatBytes(artifact.sizeBytes)}</small></div><button className="outline-button" onClick={() => onDownload(artifact)}>下载</button>{isPreviewable(artifact.mediaType) && <button className="text-button" onClick={() => onPreview(artifact)}>查看内容</button>}</li>)}</ul>;
 }
 
 function InteractionCard({ interaction, onRespond }: { interaction: TaskPresentation['interactions'][number]; onRespond: (interactionId: string, response: Record<string, unknown>, message?: string) => void }) {

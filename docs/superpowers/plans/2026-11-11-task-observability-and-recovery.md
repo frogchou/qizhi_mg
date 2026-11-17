@@ -156,4 +156,3 @@
 - [ ] **Step 4: Verify the stuck task records a terminal/recovery activity instead of remaining opaque**
 - [ ] **Step 5: In the rendered console, verify live SSE connection and at least one visible activity transition**
 - [ ] **Step 6: Commit deployment-ready documentation changes**
-

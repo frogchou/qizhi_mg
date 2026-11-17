@@ -5,7 +5,7 @@ import { copyFile, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promise
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Transform, type Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import type { DataSource } from 'typeorm';
+import type { DataSource, EntityManager } from 'typeorm';
 
 import { TaskWorkspaceService } from './task-workspace.service.js';
 
@@ -14,7 +14,22 @@ export const DEFAULT_MAX_TASK_INPUT_FILE_BYTES = 100 * 1024 * 1024;
 export const DEFAULT_MAX_TASK_INPUT_COUNT = 25;
 export const DEFAULT_MAX_TASK_INPUT_TOTAL_BYTES = 500 * 1024 * 1024;
 
+type BasketSource = 'qizhi_local_file' | 'ragflow_chunk' | 'ragflow_document';
+type InputOrigin = { sourceType: BasketSource; basketItemId: string };
+
+/** Source labels describe the operator's uploaded bytes; they never authorize a server-side read. */
+export function uploadOrigin(source: unknown, id: unknown): InputOrigin | undefined {
+  if (source === undefined && id === undefined) return undefined;
+  if ((source !== 'qizhi_local_file' && source !== 'ragflow_chunk' && source !== 'ragflow_document') ||
+      typeof id !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) {
+    throw new BadRequestException('资料筐来源或条目标识无效。');
+  }
+  return {sourceType: source, basketItemId: id};
+}
+
 type UploadRow = {
+  sourceType: BasketSource | 'uploaded_file';
+  basketItemId: string | null;
   id: string;
   ownerSubject: string;
   originalFilename: string;
@@ -80,7 +95,7 @@ export class TaskInputService {
     return { maxFileBytes: this.maxFileBytes, maxInputCount: this.maxInputCount, maxTotalBytes: this.maxTotalBytes };
   }
 
-  public async stageUpload(input: { ownerSubject?: string; originalFilename: string; mediaType?: string; stream: Readable }): Promise<TaskInputSummary & { expiresAt: string }> {
+  public async stageUpload(input: { ownerSubject?: string; originalFilename: string; mediaType?: string; stream: Readable; origin?: InputOrigin }): Promise<TaskInputSummary & { expiresAt: string }> {
     const ownerSubject = input.ownerSubject ?? TASK_INPUT_OWNER;
     const originalFilename = validatedFileName(input.originalFilename);
     const mediaType = validatedMediaType(input.mediaType);
@@ -110,12 +125,12 @@ export class TaskInputService {
       const sha256 = hash.digest('hex');
       const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1_000);
       await this.dataSource.query(
-        `INSERT INTO task_input_uploads (id, owner_subject, original_filename, media_type, size_bytes, sha256, storage_key, state, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'ready',$8)`,
-        [id, ownerSubject, originalFilename, mediaType, sizeBytes, sha256, storageKey, expiresAt],
+        `INSERT INTO task_input_uploads (id, owner_subject, original_filename, media_type, size_bytes, sha256, storage_key, state, expires_at, source_type, basket_item_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'ready',$8,$9,$10)`,
+        [id, ownerSubject, originalFilename, mediaType, sizeBytes, sha256, storageKey, expiresAt, input.origin?.sourceType ?? 'uploaded_file', input.origin?.basketItemId ?? null],
       );
       await this.audit({ uploadId: id, action: 'uploaded', actorSubject: ownerSubject, detail: { originalFilename, mediaType, sizeBytes, sha256 } });
-      return { id, sourceType: 'uploaded_file', displayName: originalFilename, originalFilename, mediaType, sizeBytes, sha256, provenance: { uploadId: id }, createdAt: new Date().toISOString(), expiresAt: expiresAt.toISOString() };
+      return { id, sourceType: input.origin?.sourceType ?? 'uploaded_file', displayName: originalFilename, originalFilename, mediaType, sizeBytes, sha256, provenance: { uploadId: id, ...input.origin }, createdAt: new Date().toISOString(), expiresAt: expiresAt.toISOString() };
     } catch (error) {
       await rm(dirname(target), { recursive: true, force: true });
       throw error;
@@ -124,61 +139,78 @@ export class TaskInputService {
 
   /** Converts ready uploads to task-owned snapshots. An upload may be consumed once only. */
   public async freezeForTask(taskId: string, uploadIds: readonly string[], ownerSubject = TASK_INPUT_OWNER): Promise<TaskInputSummary[]> {
-    if (uploadIds.length === 0) return [];
+    if (!uploadIds.length) return [];
+    return this.withFrozenUploads(taskId,uploadIds,ownerSubject,async (_manager,freeze) => freeze());
+  }
+
+  /** Holds the task/upload rows until the consuming action and its immutable input records commit together. */
+  public async withFrozenUploads<T>(taskId: string, uploadIds: readonly string[], ownerSubject: string,
+    consume: (manager: EntityManager, freeze: () => Promise<TaskInputSummary[]>) => Promise<T>): Promise<T> {
     if (uploadIds.length > this.maxInputCount) throw new BadRequestException(`一个任务最多可附加 ${this.maxInputCount} 个文件。`);
     if (new Set(uploadIds).size !== uploadIds.length) throw new BadRequestException('同一附件不能在一个任务中重复引用。');
     if (uploadIds.some((id) => !isIdentifier(id))) throw new BadRequestException('附件标识无效。');
 
-    const uploads = await this.dataSource.query<UploadRow[]>(`
-      SELECT id, owner_subject AS "ownerSubject", original_filename AS "originalFilename", media_type AS "mediaType", size_bytes AS "sizeBytes", sha256, storage_key AS "storageKey", state, expires_at AS "expiresAt"
-      FROM task_input_uploads WHERE id = ANY($1::text[]) AND owner_subject=$2 AND state='ready' AND expires_at > now()
-    `, [uploadIds, ownerSubject]);
-    if (uploads.length !== uploadIds.length) throw new BadRequestException('存在未知、过期或已被使用的附件。请重新上传后提交。');
-    const totalBytes = uploads.reduce((sum, upload) => sum + Number(upload.sizeBytes), 0);
-    if (totalBytes > this.maxTotalBytes) throw new BadRequestException(`附件总量超过任务限制（${this.maxTotalBytes} 字节）。`);
-
     const copies: Array<{ input: TaskInputSummary; upload: UploadRow; destination: string }> = [];
+    const createdDirectories: string[] = [];
+    let result: T;
     try {
-      for (const upload of uploads) {
-        const source = this.stagingPath(upload.storageKey);
-        const sourceInfo = await lstat(source);
-        if (!sourceInfo.isFile() || sourceInfo.size !== Number(upload.sizeBytes) || await sha256ForFile(source) !== upload.sha256) {
-          throw new BadRequestException('附件暂存校验失败，请重新上传。');
-        }
-        const id = randomUUID();
-        const storageName = storedFileName(upload.originalFilename);
-        const workspaceRelativePath = join('inputs', id, 'original', storageName);
-        const destination = await this.workspaces.resolveTaskPath(taskId, workspaceRelativePath);
-        await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
-        await copyFile(source, destination);
-        if (await sha256ForFile(destination) !== upload.sha256) throw new Error('任务资料快照的摘要校验失败。');
-        const provenance = { sourceType: 'uploaded_file', uploadId: upload.id, frozenAt: new Date().toISOString() };
-        await writeFile(join(dirname(dirname(destination)), 'provenance.json'), `${JSON.stringify({ id, originalFilename: upload.originalFilename, mediaType: upload.mediaType, sizeBytes: Number(upload.sizeBytes), sha256: upload.sha256, ...provenance }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-        copies.push({
-          input: { id, sourceType: 'uploaded_file', displayName: upload.originalFilename, originalFilename: upload.originalFilename, mediaType: upload.mediaType, sizeBytes: Number(upload.sizeBytes), sha256: upload.sha256, provenance, createdAt: new Date().toISOString() },
-          upload,
-          destination,
+      result = await this.dataSource.transaction(async manager => {
+        await manager.query('SELECT id FROM tasks WHERE id=$1 FOR UPDATE',[taskId]);
+        return consume(manager, async () => {
+          if (!uploadIds.length) return [];
+          const uploads = await manager.query<UploadRow[]>(`
+            SELECT id, owner_subject AS "ownerSubject", original_filename AS "originalFilename", media_type AS "mediaType", size_bytes AS "sizeBytes", sha256, storage_key AS "storageKey", state, expires_at AS "expiresAt", source_type AS "sourceType", basket_item_id AS "basketItemId"
+            FROM task_input_uploads WHERE id = ANY($1::text[]) AND owner_subject=$2 AND state='ready' AND expires_at > now() ORDER BY id FOR UPDATE
+          `, [uploadIds, ownerSubject]);
+          if (uploads.length !== uploadIds.length) throw new BadRequestException('存在未知、过期或已被使用的附件。请重新上传后提交。');
+          const totalBytes = uploads.reduce((sum, upload) => sum + Number(upload.sizeBytes), 0);
+          if (totalBytes > this.maxTotalBytes) throw new BadRequestException(`附件总量超过任务限制（${this.maxTotalBytes} 字节）。`);
+          const [existing] = await manager.query<Array<{count:string;bytes:string}>>(
+            "SELECT count(*) AS count,coalesce(sum(size_bytes),0) AS bytes FROM task_inputs WHERE task_id=$1 AND NOT(source_type='agent_artifact' AND provenance ? 'artifactId')",[taskId]);
+          if (Number(existing.count)+uploads.length>this.maxInputCount || Number(existing.bytes)+totalBytes>this.maxTotalBytes)
+            throw new BadRequestException('本次新增资料超过工单附件数量或总字节限制。');
+          for (const upload of uploads) {
+            const source = this.stagingPath(upload.storageKey);
+            const sourceInfo = await lstat(source);
+            if (!sourceInfo.isFile() || sourceInfo.size !== Number(upload.sizeBytes) || await sha256ForFile(source) !== upload.sha256) {
+              throw new BadRequestException('附件暂存校验失败，请重新上传。');
+            }
+            const id = randomUUID();
+            const storageName = storedFileName(upload.originalFilename);
+            const workspaceRelativePath = join('inputs', id, 'original', storageName);
+            const destination = await this.workspaces.resolveTaskPath(taskId, workspaceRelativePath);
+            await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+            createdDirectories.push(dirname(dirname(destination)));
+            await copyFile(source, destination);
+            if (await sha256ForFile(destination) !== upload.sha256) throw new Error('任务资料快照的摘要校验失败。');
+            const provenance = { sourceType: upload.sourceType, uploadId: upload.id, ...(upload.basketItemId ? { basketItemId: upload.basketItemId } : {}), frozenAt: new Date().toISOString() };
+            await writeFile(join(dirname(dirname(destination)), 'provenance.json'), `${JSON.stringify({ id, originalFilename: upload.originalFilename, mediaType: upload.mediaType, sizeBytes: Number(upload.sizeBytes), sha256: upload.sha256, ...provenance }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+            copies.push({
+              input: { id, sourceType: upload.sourceType, displayName: upload.originalFilename, originalFilename: upload.originalFilename, mediaType: upload.mediaType, sizeBytes: Number(upload.sizeBytes), sha256: upload.sha256, provenance, createdAt: new Date().toISOString() },
+              upload,
+              destination,
+            });
+          }
+          for (const copy of copies) {
+            const workspaceRelativePath = relative(this.workspaces.taskRoot(taskId), copy.destination);
+            await manager.query(
+              `INSERT INTO task_inputs (id, task_id, source_type, display_name, original_filename, media_type, size_bytes, sha256, workspace_relative_path, source_ref, provenance)
+               VALUES ($1,$2,$11,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)`,
+              [copy.input.id, taskId, copy.input.displayName, copy.input.originalFilename, copy.input.mediaType, copy.input.sizeBytes, copy.input.sha256, workspaceRelativePath, JSON.stringify({ uploadId: copy.upload.id, ...(copy.upload.basketItemId ? {basketItemId:copy.upload.basketItemId} : {}) }), JSON.stringify(copy.input.provenance),copy.input.sourceType],
+            );
+            await manager.query(`UPDATE task_input_uploads SET state='consumed' WHERE id=$1 AND state='ready'`, [copy.upload.id]);
+            await manager.query(`INSERT INTO task_input_audits (task_id, task_input_id, upload_id, action, actor_subject, detail) VALUES ($1,$2,$3,'frozen',$4,$5::jsonb)`, [taskId, copy.input.id, copy.upload.id, ownerSubject, JSON.stringify({ displayName: copy.input.displayName, sha256: copy.input.sha256, sizeBytes: copy.input.sizeBytes })]);
+          }
+          return copies.map(copy => copy.input);
         });
-      }
-
-      await this.dataSource.transaction(async (manager) => {
-        for (const copy of copies) {
-          const workspaceRelativePath = relative(this.workspaces.taskRoot(taskId), copy.destination);
-          await manager.query(
-            `INSERT INTO task_inputs (id, task_id, source_type, display_name, original_filename, media_type, size_bytes, sha256, workspace_relative_path, source_ref, provenance)
-             VALUES ($1,$2,'uploaded_file',$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)`,
-            [copy.input.id, taskId, copy.input.displayName, copy.input.originalFilename, copy.input.mediaType, copy.input.sizeBytes, copy.input.sha256, workspaceRelativePath, JSON.stringify({ uploadId: copy.upload.id }), JSON.stringify(copy.input.provenance)],
-          );
-          await manager.query(`UPDATE task_input_uploads SET state='consumed' WHERE id=$1 AND state='ready'`, [copy.upload.id]);
-          await manager.query(`INSERT INTO task_input_audits (task_id, task_input_id, upload_id, action, actor_subject, detail) VALUES ($1,$2,$3,'frozen',$4,$5::jsonb)`, [taskId, copy.input.id, copy.upload.id, ownerSubject, JSON.stringify({ displayName: copy.input.displayName, sha256: copy.input.sha256, sizeBytes: copy.input.sizeBytes })]);
-        }
       });
     } catch (error) {
-      await Promise.all(copies.map((copy) => rm(dirname(dirname(copy.destination)), { recursive: true, force: true })));
+      // The staging uploads remain ready when the consuming transaction rolls back.
+      await Promise.allSettled(createdDirectories.map(path=>rm(path,{recursive:true,force:true})));
       throw error;
     }
-    await Promise.all(uploads.map((upload) => rm(dirname(this.stagingPath(upload.storageKey)), { recursive: true, force: true })));
-    return copies.map((copy) => copy.input);
+    await Promise.allSettled(copies.map(copy=>rm(dirname(this.stagingPath(copy.upload.storageKey)),{recursive:true,force:true})));
+    return result;
   }
 
   /**

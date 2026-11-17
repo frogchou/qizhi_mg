@@ -1,6 +1,6 @@
 import { Type } from '@sinclair/typebox';
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ReadyCapability } from '../../packages/agent-protocol/src/index';
@@ -65,7 +65,7 @@ describe('CodexPlannerService', () => {
     expect(planned.nodeReasons).toMatchObject({ 'retrieve-project': '获取项目基本信息' });
     expect(planned.plan.nodes).toHaveLength(4);
     expect(runner.run).toHaveBeenCalledWith(expect.objectContaining({
-      workspacePath: '/tmp/task-438c/plans',
+      workspacePath: join('/tmp/task-438c', 'plans'),
       outputSchemaPath: expect.stringContaining('planner-output.schema.json'),
       prompt: expect.stringContaining('knowledge.retrieve'),
     }));
@@ -90,6 +90,33 @@ describe('CodexPlannerService', () => {
     expect(prompt).toContain('栖知资料.txt');
     expect(prompt).toContain('input-brief');
     expect(prompt).not.toContain('附件正文');
+  });
+
+  it('requires substantive delivery using the supplied catalog rather than substituting a quality conclusion', async () => {
+    const capability = 'available.file_summary';
+    const catalog: ReadyCapability[] = [{
+      agentId: 'file-reader', version: '1.0.0', capability,
+      description: '读取授权文件并交付内容总结与用途说明', runtime: 'codex',
+      inputSchema: Type.Object({ requirements: Type.String(), referenceMaterials: Type.Array(Type.String()) }),
+      resultSchema: Type.Object({ answer: Type.String() }),
+    }];
+    const response = { ...output, nodeReasons: [{ nodeId: 'analyze', reason: '读取授权文件并提供完整分析正文' }], planJson: JSON.stringify({ version: 'v1', nodes: [
+      { id: 'analyze', type: 'agent_call', capability, input: { requirements: '总结内容并解释用途', referenceMaterials: [] }, taskInputBindings: [{ target: 'referenceMaterials', inputId: 'file-1', format: 'task_input_paths' }], workspace: { mode: 'isolated' } },
+      { id: 'finish', type: 'end', dependsOn: ['analyze'] },
+    ] }) };
+    const runner: CodexRunner = { run: vi.fn().mockResolvedValue({ lastMessage: JSON.stringify(response) }) };
+    const planned = await new CodexPlannerService(runner).plan({
+      task: { id: 'task-summary', goal: '总结文件并说明它的用途', acceptanceMode: 'platform_auto', inputs: [{ id: 'file-1', displayName: '说明.md', sourceType: 'uploaded_file', mediaType: 'text/markdown', sizeBytes: 45, sha256: 'a'.repeat(64) }] },
+      capabilities: catalog, workspacePath: '/tmp/task-summary',
+    });
+    const prompt = vi.mocked(runner.run).mock.calls[0][0].prompt;
+    expect(prompt).toContain(capability);
+    expect(prompt).not.toContain('document.analyze');
+    expect(prompt).toContain('完整答复或交付文件');
+    expect(prompt).toContain('质量验收结论不能代替用户要求的正文');
+    expect(prompt).toContain('先生产实际交付物');
+    expect(prompt).toContain('普通文件总结无需强制追加质量节点');
+    expect(planned.plan.nodes[0]).toMatchObject({ capability, taskInputBindings: [{ inputId: 'file-1' }] });
   });
 
   it('rejects malformed planner output rather than treating free text as a plan', async () => {

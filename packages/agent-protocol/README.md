@@ -34,3 +34,17 @@ choose executable binaries directly.
 
 Run `corepack pnpm protocol:export` after a schema change. Generated schemas
 are the portable contract for future non-TypeScript agents.
+
+## User-facing delivery content
+
+Use `AgentResult.output.answer` for the complete Markdown answer, or `output.text`
+for legacy textual results. A short `output.summary` is an execution overview and
+must not replace the requested substantive content. Never treat `passed: true`
+or an artifact-generation acknowledgement as the user's requested answer.
+
+All files must still appear in `artifacts` with their actual path and SHA-256.
+Optional `output.deliveryArtifactPaths: string[]` identifies the subset intended
+as deliverables; other declared files remain available as supporting records.
+This convention uses the existing open output object, so no wire-schema or
+protocol-version change is required. The control plane validates and archives
+artifacts as before. See the task module's `DELIVERY_CONTENT.md` for the projection.

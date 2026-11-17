@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { copyFile, mkdir, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { DataSource } from 'typeorm';
 
@@ -26,7 +26,7 @@ export type SchedulerConfig = {
 
 type TaskActivityAppender = { append(input: TaskActivityInput): Promise<unknown> };
 
-type TaskRow = { id: string; goal: string; directAnswer?:string; createdAt: Date; acceptanceMode: string; state: string; workspacePath: string };
+type TaskRow = { id: string; goal: string; directAnswer?:string; createdAt: Date; acceptanceMode: string; state: string; workspacePath: string; revisionNumber:number };
 type PlanRow = { id: string; plan: CompiledTaskPlan & { nodeReasons?: Record<string, string> } };
 type NodeRow = {
   id: string; nodeKey: string; state: string; input: Record<string, unknown>; output: Record<string, unknown> | null;
@@ -43,7 +43,7 @@ type MaterializedNodeInput = { input: Record<string, unknown>; taskInputs: NonNu
  */
 export class TaskSchedulerService {
   private readonly advances = new Map<string, Set<Promise<void>>>();
-  private readonly evaluating = new Map<string,{controller:AbortController; done:Promise<void>}>();
+  private readonly evaluating = new Map<string,{revisionNumber:number; controller:AbortController; done:Promise<void>}>();
   private readonly runtimeRoot: string;
   private readonly leaseSeconds: number;
 
@@ -145,34 +145,46 @@ export class TaskSchedulerService {
     await this.evaluate(task,await this.nodes(taskId));
   }
 
-  private async evaluate(task:TaskRow,nodes:NodeRow[]) {
-    const latestState=await this.loadTask(task.id);
-    if(latestState.state!==task.state) return;
+  private async evaluate(task:TaskRow,nodes:NodeRow[]): Promise<void> {
     const active=this.evaluating.get(task.id);
-    if(active) return active.done;
+    if(active) {
+      if(active.revisionNumber===task.revisionNumber) return active.done;
+      await active.done;
+      return this.evaluate(task,nodes);
+    }
     const controller=new AbortController();
-    const done=this.evaluateOnce(task,nodes,controller.signal).finally(()=>this.evaluating.delete(task.id));
-    this.evaluating.set(task.id,{controller,done});
+    // Register before awaiting the database, so a concurrent stop always sees this evaluation.
+    const done=this.loadTask(task.id).then(latest => {
+      if (!controller.signal.aborted && latest.state === task.state && latest.revisionNumber===task.revisionNumber) return this.evaluateOnce(task,nodes,controller.signal);
+    }).finally(()=>this.evaluating.delete(task.id));
+    this.evaluating.set(task.id,{revisionNumber:task.revisionNumber,controller,done});
     return done;
   }
 
   private async evaluateOnce(task:TaskRow,nodes:NodeRow[],signal:AbortSignal) {
-    const [previous]=await this.dataSource.query('SELECT round,criteria,decision FROM task_acceptance_rounds WHERE task_id=$1 ORDER BY round DESC LIMIT 1',[task.id]);
-    const round=Number(previous?.round ?? 0)+1;
+    const [previous]=await this.dataSource.query('SELECT round,criteria,decision FROM task_acceptance_rounds WHERE task_id=$1 AND revision_number=$2 ORDER BY round DESC LIMIT 1',[task.id,task.revisionNumber]);
+    const [{round}]=await this.dataSource.query('SELECT coalesce(max(round),0)+1 AS round FROM task_acceptance_rounds WHERE task_id=$1',[task.id]);
     if(previous && previous.decision!=='supplement') return;
     await this.activities?.append({taskId:task.id,kind:'acceptance_started',state:task.state,message:'中台正在按原始需求逐项核对交付证据。',source:'control_plane'});
     const material:DeliveryNode[]=[...nodes];
     if (task.directAnswer) material.unshift({nodeKey:'control-plane-answer',capability:'control_plane.answer',output:{output:{summary:task.directAnswer}}});
     signal.throwIfAborted();
-    const {criteria,assessment}=await assessDelivery(this.evaluator,task.workspacePath,task.goal,new Date(task.createdAt).toISOString(),material,(previous?.criteria ?? []) as Criterion[],signal);
+    const {criteria,assessment}=await assessDelivery(this.evaluator,task.workspacePath,task.goal,new Date(task.createdAt).toISOString(),material,(previous?.criteria ?? []) as Criterion[],signal,async (stage,status) => {
+      if (signal.aborted) return;
+      const action = stage === 'criteria' ? '提取验收标准' : '核对交付证据';
+      const seconds = Math.floor(status.elapsedMs / 1_000);
+      await this.activities?.append({taskId:task.id,kind:'acceptance_progress',state:task.state,source:'control_plane',
+        message: status.state === 'started' ? `中台开始${action}。` : `中台仍在${action}，本步骤已用 ${seconds} 秒。`,
+        detail:{round,stage,runtime:'codex',elapsedMs:status.elapsedMs,outputReceived:status.outputReceived}});
+    });
     const unresolved=criteria.some(c=>c.priority==='required' && assessment.items.find(i=>i.id===c.id)?.status!=='met');
-    const state=assessment.review || unresolved || task.acceptanceMode==='human_review' ? 'awaiting_review':'accepted';
+    const state=assessment.review || unresolved || task.acceptanceMode==='human_review' || task.revisionNumber>0 ? 'awaiting_review':'accepted';
     const message=state==='accepted'?'中台已核实原始需求的必需项。':'已保留当前交付和逐项核验记录，等待管理员决定。';
     signal.throwIfAborted();
     const saved=await this.dataSource.transaction(async manager=>{
-      const [,changed]=await manager.query('UPDATE tasks SET state=$2,updated_at=now() WHERE id=$1 AND state=$3',[task.id,state,task.state]);
+      const [,changed]=await manager.query('UPDATE tasks SET state=$2,updated_at=now() WHERE id=$1 AND state=$3 AND revision_number=$4',[task.id,state,task.state,task.revisionNumber]);
       if(!changed) return false;
-      await manager.query('INSERT INTO task_acceptance_rounds(id,task_id,round,criteria,assessment) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb)',[randomUUID(),task.id,round,JSON.stringify(criteria),JSON.stringify(assessment)]);
+      await manager.query('INSERT INTO task_acceptance_rounds(id,task_id,round,criteria,assessment,revision_number) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6)',[randomUUID(),task.id,round,JSON.stringify(criteria),JSON.stringify(assessment),task.revisionNumber]);
       return true;
     });
     if(!saved) return;
@@ -188,7 +200,7 @@ export class TaskSchedulerService {
       if (item.type === 'agent_call') {
         const node = item as AgentNode & { agentId: string; agentVersion: string };
         if (!node.agentId || !node.agentVersion) throw new Error(`Compiled node ${node.id} has no selected reviewed agent version.`);
-        const workspacePath = await this.workspaces.createNodeWorkspace(task.id, node.id);
+        const workspacePath = await this.workspaces.createNodeWorkspace(task.id, node.id,task.revisionNumber);
         await this.insertPlanNode(plan, node, {
           input: node.input, capability: node.capability, agentId: node.agentId, agentVersion: node.agentVersion,
           workspacePath, displayTitle: node.capability, rationale: reasons[node.id] ?? null,
@@ -262,6 +274,8 @@ export class TaskSchedulerService {
     if (!claimed) return;
     let attemptId: string | undefined;
     try {
+      const unavailable=await this.dataSource.query("SELECT status FROM agent_versions WHERE agent_id=$1 AND version=$2 AND status<>'ready'",[node.agentId,node.agentVersion]);
+      if(unavailable.length)throw new Error(`任务绑定的智能体版本不可用（${unavailable[0].status}）`);
       const materialized = await this.materializeBindings(task, plan.plan, node, byKey);
       const input = materialized.input;
       const instanceId = randomUUID();
@@ -277,7 +291,7 @@ export class TaskSchedulerService {
         resultCallback: { url: `${this.config.callbackBaseUrl}/internal/v1/instances/${instanceId}/result` }, deadlineAt,
         ...(resume ? { resume } : {}),
       };
-      const envelopePath = await this.workspaces.writeNodeEnvelope(task.id, node.nodeKey, envelope);
+      const envelopePath = await this.workspaces.writeNodeEnvelope(task.id, node.nodeKey, envelope,task.revisionNumber);
       const environmentFile = await this.writeEnvironmentFile(instanceId, envelopePath);
       attemptId = randomUUID();
       await this.dataSource.query(`INSERT INTO task_attempts (id, task_node_id, instance_id, attempt_number, lease_token, lease_expires_at, state) VALUES ($1,$2,$3,$4,$5,$6,'leased')`, [attemptId, node.id, instanceId, attemptNumber, leaseToken, deadlineAt]);
@@ -356,6 +370,11 @@ export class TaskSchedulerService {
       await mkdir(inputDirectory, { recursive: true });
       const destination = join(inputDirectory, `${safeFile(material.id)}-${safeFile(basename(sourcePath))}`);
       await copyFile(sourcePath, destination);
+      if(material.sourceType==='agent_artifact') {
+        const bytes=await readFile(destination);
+        if(bytes.length!==Number(material.sizeBytes)||createHash('sha256').update(bytes).digest('hex')!==material.sha256)
+          throw new Error('上一版归档制品校验失败，无法授予该节点。');
+      }
       const nodeRelativePath = relative(node.workspacePath, destination);
       appendInput(input, binding.target, nodeRelativePath);
       taskInputs.set(material.id, {
@@ -390,7 +409,8 @@ export class TaskSchedulerService {
   }
 
   private async loadTask(taskId: string): Promise<TaskRow> {
-    const rows = await this.dataSource.query<TaskRow[]>(`SELECT id, goal, CASE WHEN planner_summary->>'mode'='direct_answer' THEN planner_summary->>'summary' END AS "directAnswer", created_at AS "createdAt", acceptance_mode AS "acceptanceMode", state, workspace_path AS "workspacePath" FROM tasks WHERE id=$1`, [taskId]);
+    const rows = await this.dataSource.query<TaskRow[]>(`SELECT id, coalesce(effective_goal,goal) AS goal, revision_number AS "revisionNumber",
+      CASE WHEN planner_summary->>'mode'='direct_answer' THEN planner_summary->>'summary' END AS "directAnswer", created_at AS "createdAt", acceptance_mode AS "acceptanceMode", state, workspace_path AS "workspacePath" FROM tasks WHERE id=$1`, [taskId]);
     if (!rows[0]) throw new Error('Task not found.');
     return rows[0];
   }
@@ -399,14 +419,14 @@ export class TaskSchedulerService {
     const rows = await this.dataSource.query<PlanRow[]>(`SELECT id, plan FROM task_plans WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, [taskId]);
     if (!rows[0]) throw new Error('Task has no compiled plan.');
     const plan=json(rows[0].plan) as PlanRow['plan'];
-    const supplements=await this.dataSource.query("SELECT supplement_node FROM task_acceptance_rounds WHERE task_id=$1 AND supplement_node IS NOT NULL ORDER BY round",[taskId]);
+    const supplements=await this.dataSource.query("SELECT supplement_node FROM task_acceptance_rounds WHERE task_id=$1 AND revision_number=(SELECT revision_number FROM tasks WHERE id=$1) AND supplement_node IS NOT NULL ORDER BY round",[taskId]);
     return { ...rows[0], plan:{...plan,nodes:[...plan.nodes,...supplements.map((r:{supplement_node:AgentNode})=>r.supplement_node)]} };
   }
 
   private async nodes(taskId: string): Promise<NodeRow[]> {
     const rows = await this.dataSource.query<NodeRow[]>(`
       SELECT n.id, n.node_key AS "nodeKey", n.state, n.input, n.output, n.node_type AS "nodeType", n.capability AS "capability", n.agent_id AS "agentId", n.agent_version AS "agentVersion", n.depends_on AS "dependsOn", n.workspace_path AS "workspacePath", n.rationale
-      FROM task_nodes n JOIN task_plans p ON p.id=n.plan_id WHERE p.task_id=$1 ORDER BY n.created_at
+      FROM task_nodes n JOIN task_plans p ON p.id=n.plan_id WHERE p.task_id=$1 AND p.version=(SELECT max(version) FROM task_plans WHERE task_id=$1) ORDER BY n.created_at
     `, [taskId]);
     return rows.map((row) => ({ ...row, input: json(row.input) as Record<string, unknown>, output: row.output ? json(row.output) as Record<string, unknown> : null, dependsOn: json(row.dependsOn) as string[] }));
   }

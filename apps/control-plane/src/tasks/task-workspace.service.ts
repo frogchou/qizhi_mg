@@ -48,8 +48,10 @@ export class TaskWorkspaceService {
     await rm(this.taskRoot(taskId), { recursive: true, force: true });
   }
 
-  public async createNodeWorkspace(taskId: string, nodeKey: string): Promise<string> {
-    const path = await this.resolveTaskPath(taskId, join('nodes', safeSegment(nodeKey)));
+  public async createNodeWorkspace(taskId: string, nodeKey: string, revisionNumber=0): Promise<string> {
+    if (!Number.isSafeInteger(revisionNumber)||revisionNumber<0) throw new Error('Invalid task revision number.');
+    const root = revisionNumber ? join('revisions',String(revisionNumber),'nodes') : 'nodes';
+    const path = await this.resolveTaskPath(taskId, join(root, safeSegment(nodeKey)));
     await mkdir(path, { recursive: true });
     return path;
   }
@@ -62,9 +64,8 @@ export class TaskWorkspaceService {
     return path;
   }
 
-  public async writeNodeEnvelope(taskId: string, nodeKey: string, envelope: unknown): Promise<string> {
-    await this.createNodeWorkspace(taskId, nodeKey);
-    const path = await this.resolveTaskPath(taskId, join('nodes', safeSegment(nodeKey), 'envelope.json'));
+  public async writeNodeEnvelope(taskId: string, nodeKey: string, envelope: unknown, revisionNumber=0): Promise<string> {
+    const path = join(await this.createNodeWorkspace(taskId, nodeKey, revisionNumber),'envelope.json');
     await this.writeJson(path, envelope);
     return path;
   }
@@ -91,8 +92,8 @@ export class TaskWorkspaceService {
   }
 
   /** Seals verified checkpoint bytes beneath their node, preserving no agent-controlled path. */
-  public async writeNodeCheckpoint(taskId: string, nodeKey: string, resumeKey: string, checkpoint: Buffer): Promise<{ workspaceRelativePath: string; sha256: string }> {
-    const nodeWorkspace = await this.createNodeWorkspace(taskId, nodeKey);
+  public async writeNodeCheckpoint(taskId: string, nodeKey: string, resumeKey: string, checkpoint: Buffer, revisionNumber=0): Promise<{ workspaceRelativePath: string; sha256: string }> {
+    const nodeWorkspace = await this.createNodeWorkspace(taskId, nodeKey,revisionNumber);
     const directory = join(nodeWorkspace, 'checkpoints');
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const path = join(directory, `${safeSegment(resumeKey)}.checkpoint`);
@@ -101,8 +102,8 @@ export class TaskWorkspaceService {
   }
 
   /** Writes a versioned local input made from an already archived prior delivery. */
-  public async writeNodeReworkInput(taskId: string, nodeKey: string, fileName: string, content: string | Buffer): Promise<string> {
-    const nodeWorkspace = await this.createNodeWorkspace(taskId, nodeKey);
+  public async writeNodeReworkInput(taskId: string, nodeKey: string, fileName: string, content: string | Buffer, revisionNumber=0): Promise<string> {
+    const nodeWorkspace = await this.createNodeWorkspace(taskId, nodeKey,revisionNumber);
     const path = join(nodeWorkspace, 'input', safeSegment(fileName));
     await mkdir(join(nodeWorkspace, 'input'), { recursive: true });
     await writeFile(path, content);
@@ -110,17 +111,17 @@ export class TaskWorkspaceService {
   }
 
   /** Removes only named, mutable node outputs before a human-requested rework. */
-  public async clearNodeReworkOutputs(taskId: string, nodeKey: string, outputPaths: readonly string[]): Promise<void> {
-    const nodeWorkspace = await this.createNodeWorkspace(taskId, nodeKey);
+  public async clearNodeReworkOutputs(taskId: string, nodeKey: string, outputPaths: readonly string[], revisionNumber=0): Promise<void> {
+    const nodeWorkspace = await this.createNodeWorkspace(taskId, nodeKey,revisionNumber);
     await Promise.all(outputPaths.map(async (outputPath) => {
       const target = resolveNodeOutput(nodeWorkspace, outputPath);
       await rm(target, { recursive: true, force: true });
     }));
   }
 
-  public async writeReworkSnapshot(taskId: string, cycle: number, snapshot: Record<string, unknown>): Promise<string> {
+  public async writeReworkSnapshot(taskId: string, cycle: number, snapshot: Record<string, unknown>, revisionNumber=0): Promise<string> {
     if (!Number.isInteger(cycle) || cycle < 1) throw new Error('Rework cycle must be a positive integer.');
-    const path = await this.resolveTaskPath(taskId, join('session', 'rework', `${cycle}.json`));
+    const path = await this.resolveTaskPath(taskId, join('session','rework',...(revisionNumber?[String(revisionNumber)]:[]),`${cycle}.json`));
     await mkdir(dirname(path), { recursive: true });
     await this.writeJson(path, snapshot);
     return path;

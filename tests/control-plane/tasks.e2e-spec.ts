@@ -49,6 +49,7 @@ describe('task creation API', () => {
     stopInstance.mockRejectedValueOnce(new Error('node temporarily unavailable'));
     const retryable = await app.inject({ method: 'POST', url, headers: { authorization: `Bearer ${token}` } });
     expect(retryable.statusCode).toBe(409);
+    expect(retryable.json().code).toBe('task_stop_pending');
     expect((await dataSource.query('SELECT state FROM tasks WHERE id=$1', [taskId]))[0].state).toBe('stopping');
     for (let i = 0; i < 2; i++) {
       const reply = await app.inject({ method: 'POST', url, headers: { authorization: `Bearer ${token}` } });
@@ -57,6 +58,14 @@ describe('task creation API', () => {
     }
     expect(stopInstance).toHaveBeenCalledTimes(2);
     expect(stopInstance).toHaveBeenCalledWith('stop-instance');
+  });
+
+  it('protects the historical decision if a user stops an already accepted task', async () => {
+    await dataSource.query("INSERT INTO tasks(id,goal,state,acceptance_mode,workspace_path) VALUES ('task-stop-finished','已经验收','accepted','human_review',$1)", [join(workspaceRoot,'task-stop-finished')]);
+    const reply=await app.inject({method:'POST',url:'/v1/tasks/task-stop-finished/stop',headers:{authorization:`Bearer ${token}`}});
+    expect(reply.statusCode).toBe(409);
+    expect(reply.json().code).toBe('task_already_finished');
+    expect((await dataSource.query("SELECT state FROM tasks WHERE id='task-stop-finished'"))[0].state).toBe('accepted');
   });
 
   afterAll(async () => {
@@ -70,12 +79,15 @@ describe('task creation API', () => {
       method: 'POST',
       url: '/v1/tasks',
       headers: { authorization: `Bearer ${token}` },
-      payload: { goal: '制作438c项目介绍PPT', acceptanceMode: 'platform_auto' },
+      payload: { goal: '制作438c项目介绍PPT', acceptanceMode: 'platform_auto', sourceSystem: 'qizhi_desktop' },
     });
 
     expect(response.statusCode).toBe(201);
     const body = response.json<{ taskId: string; state: string }>();
     expect(body).toMatchObject({ taskId: expect.any(String), state: 'planning' });
+    expect((await dataSource.query('SELECT source_system FROM tasks WHERE id=$1', [body.taskId]))[0].source_system).toBe('qizhi_desktop');
+    const unsupported = await app.inject({ method: 'POST', url: '/v1/tasks', headers: { authorization: `Bearer ${token}` }, payload: { goal: 'origin', sourceSystem: 'wechat' } });
+    expect(unsupported.statusCode).toBe(400);
     expect((await dataSource.query<{ goal: string; workspacePath: string }[]>(`SELECT goal, workspace_path AS "workspacePath" FROM tasks WHERE id=$1`, [body.taskId]))[0].goal).toBe('制作438c项目介绍PPT');
     await expect(stat(join(workspaceRoot, body.taskId, 'task.json'))).resolves.toBeDefined();
 
@@ -119,6 +131,7 @@ describe('task creation API', () => {
     });
     expect(created.statusCode).toBe(201);
     const taskId = created.json<{ taskId: string }>().taskId;
+    expect((await dataSource.query('SELECT source_system FROM tasks WHERE id=$1', [taskId]))[0].source_system).toBe('api');
 
     const rows = await dataSource.query<Array<{ workspace_relative_path: string; sha256: string }>>(
       `SELECT workspace_relative_path, sha256 FROM task_inputs WHERE task_id=$1`, [taskId],
@@ -138,6 +151,23 @@ describe('task creation API', () => {
     expect(download.statusCode).toBe(200);
     expect(download.body).toBe(originalContent);
     expect(download.headers['content-disposition']).toContain('attachment');
+  });
+
+  it('retains basket provenance on immutable inputs and rejects partial origin labels', async () => {
+    const basketId='9e0ef66f-eab5-4c1c-a6b8-5d6c8aa53a37';
+    const headers={authorization:`Bearer ${token}`,'content-type':'multipart/form-data; boundary=origin-boundary'};
+    const payload=multipartPayload('origin-boundary','资料片段.md','text/markdown','项目片段正文');
+    const path='/v1/task-inputs/uploads';
+    const invalid=await app.inject({method:'POST',url:path,headers:{...headers,'x-qizhi-source-type':'ragflow_chunk'},payload});
+    expect(invalid.statusCode).toBe(400);
+    const staged=await app.inject({method:'POST',url:path,headers:{...headers,'x-qizhi-source-type':'ragflow_chunk','x-qizhi-basket-id':basketId},payload});
+    expect(staged.statusCode).toBe(201);
+    const {upload}=staged.json();
+    expect(upload).toMatchObject({sourceType:'ragflow_chunk',provenance:{basketItemId:basketId}});
+    const created=await app.inject({method:'POST',url:'/v1/tasks',headers:{authorization:`Bearer ${token}`},payload:{goal:'使用资料筐片段',acceptanceMode:'human_review',inputIds:[upload.id]}});
+    expect(created.statusCode).toBe(201);
+    const detail=await app.inject({method:'GET',url:'/v1/tasks/'+created.json().taskId,headers:{authorization:`Bearer ${token}`}});
+    expect(detail.json().inputs[0]).toMatchObject({sourceType:'ragflow_chunk',provenance:{basketItemId:basketId,uploadId:upload.id}});
   });
 });
 

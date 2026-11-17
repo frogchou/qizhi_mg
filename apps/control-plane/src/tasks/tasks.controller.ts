@@ -1,14 +1,16 @@
 import { BadRequestException, Body, Controller, Get, Headers, HttpCode, Inject, Param, Post, Res, UseGuards } from '@nestjs/common';
 import type { FastifyReply } from 'fastify';
 import { AdminAuthGuard } from '../config/auth.guard.js';
-import { TaskService } from './tasks.service.js';
+import { TaskService, type IntakeSource } from './tasks.service.js';
 @Controller('/v1/tasks') @UseGuards(AdminAuthGuard)
 export class TasksController {
   public constructor(@Inject(TaskService) private readonly tasks: TaskService) {}
-  @Post() public create(@Body() body: { goal?: string; acceptanceMode?: string; inputIds?: unknown }) {
-    if (!body.goal?.trim()) throw new BadRequestException('goal is required.');
+  @Post() public create(@Body() body: { goal?: string; acceptanceMode?: string; inputIds?: unknown; sourceSystem?: IntakeSource }) {
+    if (!body || typeof body.goal !== 'string' || !body.goal.trim()) throw new BadRequestException('goal is required.');
+    if (body.acceptanceMode !== undefined && !['platform_auto','human_review'].includes(body.acceptanceMode)) throw new BadRequestException('Unknown acceptanceMode.');
+    if (body.sourceSystem !== undefined && !['api','console','qizhi_desktop'].includes(body.sourceSystem)) throw new BadRequestException('Unsupported intake channel.');
     if (body.inputIds !== undefined && (!Array.isArray(body.inputIds) || body.inputIds.some((id) => typeof id !== 'string'))) throw new BadRequestException('inputIds must be an array of strings.');
-    return this.tasks.createTask(body.goal.trim(), body.acceptanceMode, body.inputIds ?? []);
+    return this.tasks.createTask(body.goal.trim(), body.acceptanceMode, body.inputIds ?? [], body.sourceSystem ?? 'api');
   }
   @Post(':taskId/stop') @HttpCode(200)
   public stop(@Param('taskId') taskId: string) { return this.tasks.stopTask(taskId); }
@@ -43,7 +45,12 @@ export class TasksController {
   }
   @Post(':taskId/interactions/:interactionId/cancel') public cancelInteraction(@Param('taskId') taskId: string, @Param('interactionId') interactionId: string) { return this.tasks.cancelInteraction(taskId, interactionId); }
   @Get(':taskId') public detail(@Param('taskId') taskId: string) { return this.tasks.getTaskDetail(taskId); }
-  @Post(':taskId/review') public review(@Param('taskId') taskId: string, @Body() body: { decision?: unknown; reviewId?:string }) { if (body.decision !== 'accept' && body.decision !== 'rework' && body.decision !== 'supplement') throw new BadRequestException('decision must be accept, supplement or rework.'); return this.tasks.reviewTask(taskId, body.decision, body.reviewId); }
+  @Post(':taskId/review') public review(@Param('taskId') taskId: string, @Headers('idempotency-key') key: string|undefined,
+    @Body() body: { decision?: unknown; reviewId?:string; message?:unknown; inputIds?:unknown }) {
+    if (body?.decision==='revise'||body?.decision==='amend') return this.tasks.requestRevision(taskId,{...body,decision:body.decision},key);
+    if (!body || (body.decision !== 'accept' && body.decision !== 'rework' && body.decision !== 'supplement')) throw new BadRequestException('无效的验收决定。');
+    return this.tasks.reviewTask(taskId, body.decision, body.reviewId);
+  }
   @Post(':taskId/approve') public approve(@Param('taskId') taskId: string) { return this.tasks.approveTask(taskId); }
 }
 

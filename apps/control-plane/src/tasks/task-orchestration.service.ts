@@ -38,6 +38,17 @@ export class TaskOrchestrationService {
     void operation.catch(() => undefined);
   }
 
+  /** A review can arrive while the preceding delivery is finishing its activity writes. */
+  public enqueueRevision(taskId:string, revisionNumber:number): void {
+    const previous=this.inFlight.get(taskId);
+    if (!previous) { this.enqueue(taskId); return; }
+    const resume=async()=>{
+      const [ready]=await this.dataSource.query("SELECT id FROM tasks WHERE id=$1 AND revision_number=$2 AND state='planning'",[taskId,revisionNumber]);
+      if(ready) this.enqueue(taskId);
+    };
+    void previous.then(resume,resume).catch(()=>this.logger?.warn('task_orchestration','revision_recovery_required',{taskId}));
+  }
+
   public async run(taskId: string, signal?: AbortSignal): Promise<void> {
     let phase: 'planning' | 'scheduling' = 'planning';
     try {

@@ -20,6 +20,9 @@ export class ControlController {
   @HttpCode(204)
   public async syncReadyVersion(@Body() body: ReadyPackageRecord): Promise<void> { await this.control.syncReadyVersion(body); }
 
+  @Post('catalog/revoke') @HttpCode(204)
+  public async revoke(@Body() body:{agentId:string;version:string}) { await this.control.revokeVersion(body.agentId,body.version); }
+
   @Post('instances/:instanceId/stop')
   @HttpCode(204)
   public async stop(@Param('instanceId') instanceId: string): Promise<void> { await this.control.stopInstance(instanceId); }

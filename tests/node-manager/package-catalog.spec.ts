@@ -28,14 +28,21 @@ describe('package catalog self-check inspection', () => {
   it('persists ready launch records and restores them after a node-manager restart', async () => {
     const root = await mkdtemp(join(tmpdir(), 'agent-catalog-'));
     const statePath = join(root, 'ready-catalog.json');
+    const packagePath = join(root, 'agents', 'ppt-maker');
+    const nextPackagePath = join(root, 'agents', 'ppt-maker-v2');
     const catalog = new PackageCatalogService({ statePath });
-    await catalog.upsertReady({ agentId: 'ppt-maker', version: '1.0.1', packagePath: '/agents/ppt-maker', entryCommand: ['../../node_modules/.bin/tsx', 'src/main.ts'] });
-    await catalog.upsertReady({ agentId: 'ppt-maker', version: '1.0.2', packagePath: '/agents/ppt-maker-v2', entryCommand: ['../../node_modules/.bin/tsx', 'src/main.ts'] });
+    await catalog.upsertReady({ agentId: 'ppt-maker', version: '1.0.1', packagePath, entryCommand: ['../../node_modules/.bin/tsx', 'src/main.ts'] });
+    await catalog.upsertReady({ agentId: 'ppt-maker', version: '1.0.2', packagePath: nextPackagePath, entryCommand: ['../../node_modules/.bin/tsx', 'src/main.ts'] });
 
     const restarted = new PackageCatalogService({ statePath });
     await restarted.load();
 
-    await expect(restarted.find('ppt-maker', '1.0.1')).resolves.toMatchObject({ status: 'ready', packagePath: '/agents/ppt-maker', entryCommand: ['/node_modules/.bin/tsx', '/agents/ppt-maker/src/main.ts'] });
-    await expect(restarted.find('ppt-maker', '1.0.2')).resolves.toMatchObject({ status: 'ready', packagePath: '/agents/ppt-maker-v2' });
+    await expect(restarted.find('ppt-maker', '1.0.1')).resolves.toMatchObject({ status: 'ready', packagePath, entryCommand: [join(root, 'node_modules', '.bin', 'tsx'), join(packagePath, 'src', 'main.ts')] });
+    await expect(restarted.find('ppt-maker', '1.0.2')).resolves.toMatchObject({ status: 'ready', packagePath: nextPackagePath });
+    await restarted.revoke('ppt-maker','1.0.1');
+    const afterRevoke = new PackageCatalogService({ statePath });
+    await afterRevoke.load();
+    expect(await afterRevoke.find('ppt-maker','1.0.1')).toBeUndefined();
+    expect(await afterRevoke.find('ppt-maker','1.0.2')).toBeDefined();
   });
 });

@@ -12,8 +12,11 @@ import { TaskArtifactService } from './task-artifact.service.js';
 import { TaskSchedulerService } from './task-scheduler.service.js';
 import { TaskInputService } from './task-input.service.js';
 import { TaskInteractionService } from './task-interaction.service.js';
+import { requestRevision, type RevisionRequest } from './task-revision.js';
+import { buildTaskDelivery } from './delivery-content.js';
 
 export const TASK_RUNTIME_CONFIG = Symbol('TASK_RUNTIME_CONFIG');
+export type IntakeSource = 'api' | 'console' | 'qizhi_desktop';
 export type TaskRuntimeConfig = {
   ragflowBaseUrl: string;
   ragflowApiKey: string;
@@ -43,13 +46,13 @@ export class TaskService {
     private readonly interactions: TaskInteractionService,
   ) {}
 
-  public async createTask(goal: string, acceptanceMode = 'platform_auto', inputIds: readonly string[] = []): Promise<{ taskId: string; state: string }> {
+  public async createTask(goal: string, acceptanceMode = 'platform_auto', inputIds: readonly string[] = [], sourceSystem: IntakeSource = 'api'): Promise<{ taskId: string; state: string }> {
     if (!['platform_auto', 'human_review'].includes(acceptanceMode)) throw new Error('acceptanceMode must be platform_auto or human_review.');
     const taskId = randomUUID();
     const workspace = await this.workspaces.create({ id: taskId, goal, acceptanceMode });
     let frozenInputs: Awaited<ReturnType<TaskInputService['freezeForTask']>> = [];
     try {
-      await this.dataSource.query(`INSERT INTO tasks (id, goal, acceptance_mode, state, workspace_path) VALUES ($1,$2,$3,'received',$4)`, [taskId, goal, acceptanceMode, workspace.root]);
+      await this.dataSource.query(`INSERT INTO tasks (id, goal, acceptance_mode, state, workspace_path, source_system) VALUES ($1,$2,$3,'received',$4,$5)`, [taskId, goal, acceptanceMode, workspace.root, sourceSystem]);
       frozenInputs = await this.inputs.freezeForTask(taskId, inputIds);
     } catch (error) {
       await this.dataSource.query(`DELETE FROM tasks WHERE id=$1`, [taskId]);
@@ -57,7 +60,7 @@ export class TaskService {
       throw error;
     }
     await this.sessions.append(taskId, { kind: 'requirement_received', message: '已接收需求信号，正在由中台分析可用能力并编排任务。' });
-    await this.activities.append({ taskId, kind: 'task_received', state: 'received', message: '已接收需求信号，任务工作目录已创建。', source: 'control_plane' });
+    await this.activities.append({ taskId, kind: 'task_received', state: 'received', message: '已接收需求信号，任务工作目录已创建。', source: 'control_plane', detail:{sourceSystem} });
     if (frozenInputs.length > 0) {
       await this.sessions.append(taskId, { kind: 'task_inputs_frozen', message: `已冻结 ${frozenInputs.length} 项任务私有资料，后续智能体仅可按编排授权读取。`, detail: { inputCount: frozenInputs.length, inputIds: frozenInputs.map((input) => input.id) } });
       await this.activities.append({ taskId, kind: 'task_inputs_frozen', state: 'received', message: `已冻结 ${frozenInputs.length} 项任务私有资料。`, detail: { inputCount: frozenInputs.length, inputs: frozenInputs.map((input) => ({ id: input.id, displayName: input.displayName, sha256: input.sha256 })) }, source: 'control_plane' });
@@ -86,7 +89,7 @@ export class TaskService {
     if (!changed) {
       const task = await this.getTask(taskId);
       if (task.state === 'cancelled') return { state: 'cancelled' };
-      if (task.state !== 'stopping') throw new ConflictException('任务已经结束。');
+      if (task.state !== 'stopping') throw new ConflictException({ code: 'task_already_finished', message: '任务已经结束。' });
     } else {
       await this.activities.append({ taskId, kind: 'stop_requested', state: 'stopping', message: '管理员已请求停止任务。', source: 'control_plane' });
     }
@@ -97,7 +100,7 @@ export class TaskService {
     } catch {
       const message = '节点管理服务未确认全部实例已停止，可重试停止任务。';
       await this.activities.append({ taskId, kind: 'stop_failed', state: 'stopping', message, source: 'control_plane' });
-      throw new ConflictException(message);
+      throw new ConflictException({ code: 'task_stop_pending', message });
     }
     await this.dataSource.transaction(async (manager) => {
       await manager.query("UPDATE task_nodes SET state='cancelled', updated_at=now() WHERE plan_id IN (SELECT id FROM task_plans WHERE task_id=$1) AND state IN ('pending','leasing','running','awaiting_user_input','interrupted')", [taskId]);
@@ -129,8 +132,14 @@ export class TaskService {
     const artifacts = (await this.artifacts.list(taskId)).map(({ storagePath: _storagePath, ...artifact }) => artifact);
     const inputs = await this.inputs.listForTask(taskId);
     const interactions = await this.interactions.listForTask(taskId);
-    const acceptanceRounds=await this.dataSource.query('SELECT id,round,criteria,assessment,decision,created_at,decided_at FROM task_acceptance_rounds WHERE task_id=$1 ORDER BY round',[taskId]);
-    return { acceptanceRounds, task, planSummary: task.planner_summary, plans, nodes, attempts, events, activities, artifacts, inputs, interactions: interactions.map((interaction) => ({ id: interaction.id, taskNodeId: interaction.taskNodeId, planNodeKey: interaction.planNodeKey, source: interaction.source, kind: interaction.kind, title: interaction.title, prompt: interaction.prompt, responseSchema: interaction.responseSchema, responseTarget: interaction.responseTarget, state: interaction.state, answer: interaction.answer, answerMessage: interaction.answerMessage, requestedAt: interaction.requestedAt, answeredAt: interaction.answeredAt, resumedAt: interaction.resumedAt })), workflow: projectWorkflowStages({ task, nodes, attempts, events, interactions }) };
+    const acceptanceRounds=await this.dataSource.query('SELECT id,round,revision_number,criteria,assessment,decision,created_at,decided_at FROM task_acceptance_rounds WHERE task_id=$1 ORDER BY round',[taskId]);
+    const revisions=await this.dataSource.query(`SELECT id,revision_number AS "revisionNumber",decision,message,input_ids AS "inputIds",review_id AS "reviewId",
+      plan_version AS "planVersion",effective_goal AS "effectiveGoal",previous_delivery AS "previousDelivery",created_at AS "createdAt"
+      FROM task_revisions WHERE task_id=$1 ORDER BY revision_number`,[taskId]);
+    const latest=acceptanceRounds.filter((r:{revision_number:number})=>r.revision_number===task.revision_number).at(-1);
+    const currentReviewId=task.state==='awaiting_review' && latest && !latest.decision ? latest.id : null;
+    const delivery = buildTaskDelivery({task,plans,nodes,artifacts,revisions,acceptanceRounds});
+    return { delivery, acceptanceRounds, revisions, currentReviewId, task, planSummary: task.planner_summary, plans, nodes, attempts, events, activities, artifacts, inputs, interactions: interactions.map((interaction) => ({ id: interaction.id, taskNodeId: interaction.taskNodeId, planNodeKey: interaction.planNodeKey, source: interaction.source, kind: interaction.kind, title: interaction.title, prompt: interaction.prompt, responseSchema: interaction.responseSchema, responseTarget: interaction.responseTarget, state: interaction.state, answer: interaction.answer, answerMessage: interaction.answerMessage, requestedAt: interaction.requestedAt, answeredAt: interaction.answeredAt, resumedAt: interaction.resumedAt })), workflow: projectWorkflowStages({ task, nodes, attempts, events, interactions }) };
   }
 
   public async listInteractions(taskId: string) {
@@ -161,6 +170,10 @@ export class TaskService {
     return this.inputs.openForDownload(taskId, inputId);
   }
 
+  public requestRevision(taskId: string, request: RevisionRequest, key: string|undefined) {
+    return requestRevision(taskId,request,key,this.inputs,this.orchestration,this.artifacts);
+  }
+
   public async approveTask(taskId: string): Promise<{ state: 'accepted'; decision: 'accept' }> {
     return this.reviewTask(taskId, 'accept') as Promise<{ state: 'accepted'; decision: 'accept' }>;
   }
@@ -171,8 +184,8 @@ export class TaskService {
     await this.dataSource.transaction(async manager=>{
       const [,changed]=await manager.query("UPDATE tasks SET state='accepted',updated_at=now() WHERE id=$1 AND state='awaiting_review'",[taskId]);
       if(!changed) throw new ConflictException('任务不在待验收状态。');
-      const [latest]=await manager.query('SELECT id,decision FROM task_acceptance_rounds WHERE task_id=$1 ORDER BY round DESC LIMIT 1',[taskId]);
-      if(latest && (latest.id!==reviewId || latest.decision)) throw new ConflictException('验收轮次已变化，请刷新页面。');
+      const [latest]=await manager.query('SELECT id,decision FROM task_acceptance_rounds WHERE task_id=$1 AND revision_number=(SELECT revision_number FROM tasks WHERE id=$1) ORDER BY round DESC LIMIT 1',[taskId]);
+      if((latest?.id??undefined)!==reviewId || latest?.decision) throw new ConflictException('验收轮次已变化，请刷新页面。');
       if(latest) await manager.query("UPDATE task_acceptance_rounds SET decision='accept',decided_at=now() WHERE id=$1",[latest.id]);
     });
     await this.sessions.append(taskId, { kind: 'human_accepted', message: '管理员已确认验收结果。' });
@@ -183,9 +196,9 @@ export class TaskService {
 
   private async supplementTask(taskId:string,reviewId?:string):Promise<{state:'running';decision:'supplement'}> {
     const round=await this.dataSource.transaction(async manager=>{
-      const [task]=await manager.query('SELECT goal,state,planner_summary FROM tasks WHERE id=$1 FOR UPDATE',[taskId]);
+      const [task]=await manager.query('SELECT coalesce(effective_goal,goal) AS goal,state,planner_summary FROM tasks WHERE id=$1 FOR UPDATE',[taskId]);
       if(!task) throw new NotFoundException('Task not found.');
-      const [latest]=await manager.query('SELECT * FROM task_acceptance_rounds WHERE task_id=$1 ORDER BY round DESC LIMIT 1',[taskId]);
+      const [latest]=await manager.query('SELECT * FROM task_acceptance_rounds WHERE task_id=$1 AND revision_number=(SELECT revision_number FROM tasks WHERE id=$1) ORDER BY round DESC LIMIT 1',[taskId]);
       if(task.state!=='awaiting_review' || !latest || latest.id!==reviewId || latest.decision) throw new ConflictException('验收轮次已变化，请刷新页面。');
       // Keep internal evidence and task-private materials on the knowledge-base route.
       const [scope]=await manager.query(`SELECT
@@ -196,7 +209,7 @@ export class TaskService {
       const [agent]=await manager.query(`SELECT agent_id,version FROM agent_versions
         WHERE status='ready' AND manifest->'capabilities' @> $1::jsonb
         AND ($2::boolean OR manifest->'inputSchema'->'properties' ? 'requirements')
-        ORDER BY approved_at DESC NULLS LAST,created_at DESC LIMIT 1`,[JSON.stringify([{name:capability}]),scope.internal]);
+        ORDER BY approved_at DESC NULLS LAST,created_at DESC LIMIT 1 FOR SHARE`,[JSON.stringify([{name:capability}]),scope.internal]);
       if(!agent) throw new ConflictException('本任务所需资料范围内没有可用的补查能力。');
       const assessment=latest.assessment;
       const criteria=latest.criteria as Array<{id:string;requirement:string;priority:string}>;
@@ -227,10 +240,10 @@ export class TaskService {
   }
 
   private async reworkTask(taskId: string): Promise<{ state: 'running'; decision: 'rework' }> {
-    const task = (await this.dataSource.query<Array<{ id: string; state: string }>>(`SELECT id, state FROM tasks WHERE id=$1`, [taskId]))[0];
+    const task = (await this.dataSource.query<Array<{ id: string; state: string; revision_number:number }>>(`SELECT id, state,revision_number FROM tasks WHERE id=$1`, [taskId]))[0];
     if (!task) throw new NotFoundException('Task not found.');
     if (task.state !== 'awaiting_review') throw new ConflictException('Task is not awaiting a human review decision.');
-    const nodes = await this.dataSource.query<Array<Record<string, unknown>>>(`SELECT n.id, n.node_key, n.state, n.input, n.output, n.capability, n.depends_on FROM task_nodes n JOIN task_plans p ON p.id=n.plan_id WHERE p.task_id=$1 ORDER BY n.created_at`, [taskId]);
+    const nodes = await this.dataSource.query<Array<Record<string, unknown>>>(`SELECT n.id, n.node_key, n.state, n.input, n.output, n.capability, n.depends_on FROM task_nodes n JOIN task_plans p ON p.id=n.plan_id WHERE p.task_id=$1 AND p.version=(SELECT max(version) FROM task_plans WHERE task_id=$1) ORDER BY n.created_at`, [taskId]);
     const quality = nodes.find((node) => text(node.capability) === 'quality.define_and_verify' && qualityFailed(record(node.output)));
     if (!quality) throw new ConflictException('Only a failed quality result may be reworked.');
     const pptKey = strings(quality.depends_on).find((dependency) => nodes.find((node) => text(node.node_key) === dependency && text(node.capability) === 'presentation.create'));
@@ -249,18 +262,18 @@ export class TaskService {
     ]);
     const pptNodeKey = text(ppt.node_key);
     await Promise.all([
-      this.workspaces.clearNodeReworkOutputs(taskId, pptNodeKey, PPT_REWORK_OUTPUTS),
-      this.workspaces.clearNodeReworkOutputs(taskId, text(quality.node_key), QUALITY_REWORK_OUTPUTS),
+      this.workspaces.clearNodeReworkOutputs(taskId, pptNodeKey, PPT_REWORK_OUTPUTS,task.revision_number),
+      this.workspaces.clearNodeReworkOutputs(taskId, text(quality.node_key), QUALITY_REWORK_OUTPUTS,task.revision_number),
     ]);
-    const presentationPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `previous-presentation-${cycle}.pptx`, pptFile.content);
-    const assessmentPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `previous-quality-assessment-${cycle}.json`, assessmentFile.content);
-    const criteriaPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `previous-acceptance-criteria-${cycle}.json`, criteriaFile.content);
+    const presentationPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `previous-presentation-${cycle}.pptx`, pptFile.content,task.revision_number);
+    const assessmentPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `previous-quality-assessment-${cycle}.json`, assessmentFile.content,task.revision_number);
+    const criteriaPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `previous-acceptance-criteria-${cycle}.json`, criteriaFile.content,task.revision_number);
     const failureSummary = qualitySummary(record(quality.output));
-    const contextPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `retry-context-${cycle}.md`, reworkContext(cycle, failureSummary, presentationPath, assessmentPath, criteriaPath));
+    const contextPath = await this.workspaces.writeNodeReworkInput(taskId, pptNodeKey, `retry-context-${cycle}.md`, reworkContext(cycle, failureSummary, presentationPath, assessmentPath, criteriaPath),task.revision_number);
     const plan = await this.currentPlan(taskId);
     const pptInput = reworkInput(plan, pptNodeKey, [presentationPath, assessmentPath, criteriaPath, contextPath]);
     const qualityInput = staticInput(plan, text(quality.node_key));
-    await this.workspaces.writeReworkSnapshot(taskId, cycle, { taskId, cycle, decision: 'rework', pptNode: pptNodeKey, qualityNode: text(quality.node_key), sourceAttempt: pptAttempt.attemptNumber, qualityAttempt: qualityAttempt.attemptNumber, failureSummary, inputs: [presentationPath, assessmentPath, criteriaPath, contextPath] });
+    await this.workspaces.writeReworkSnapshot(taskId, cycle, { taskId, cycle, decision: 'rework', pptNode: pptNodeKey, qualityNode: text(quality.node_key), sourceAttempt: pptAttempt.attemptNumber, qualityAttempt: qualityAttempt.attemptNumber, failureSummary, inputs: [presentationPath, assessmentPath, criteriaPath, contextPath] },task.revision_number);
     await this.dataSource.transaction(async (manager) => {
       await manager.query(`UPDATE task_nodes SET state='pending', input=$2::jsonb, output=NULL, updated_at=now() WHERE id=$1`, [ppt.id, JSON.stringify(pptInput)]);
       await manager.query(`UPDATE task_nodes SET state='pending', input=$2::jsonb, output=NULL, updated_at=now() WHERE id=$1`, [quality.id, JSON.stringify(qualityInput)]);

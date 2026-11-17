@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { Value } from '@sinclair/typebox/value';
@@ -10,6 +10,7 @@ export type ReadyPackageRecord = { agentId: string; version: string; packagePath
 export type SelfCheckSpec = { agentId: string; version: string; packagePath: string; command: string[] };
 
 export interface PackageCatalog {
+  revoke?(agentId:string,version:string):Promise<void>;
   find(agentId: string, version: string): Promise<PackageRecord | undefined>;
   upsertReady(record: ReadyPackageRecord): Promise<void>;
 }
@@ -17,6 +18,7 @@ export interface PackageCatalog {
 /** First-release catalog seam. Task 6 registry is the authority; HTTP wiring follows in the node-manager API. */
 export class PackageCatalogService implements PackageCatalog {
   private readonly records = new Map<string, PackageRecord>();
+  private writes:Promise<void>=Promise.resolve();
   private readonly statePath: string;
   public constructor(input: { statePath?: string } = {}) { this.statePath = input.statePath ?? '/home/middleground/data/node-manager/ready-catalog.json'; }
   public async find(agentId: string, version: string): Promise<PackageRecord | undefined> { return this.records.get(`${agentId}@${version}`); }
@@ -34,6 +36,11 @@ export class PackageCatalogService implements PackageCatalog {
       if (isMissing(error)) return;
       throw error;
     }
+  }
+
+  public async revoke(agentId:string,version:string) {
+    this.records.delete(`${agentId}@${version}`);
+    await this.persist();
   }
 
   /** Called only after control-plane approval; reads the declared command without importing package code. */
@@ -55,12 +62,18 @@ export class PackageCatalogService implements PackageCatalog {
   }
 
   private async persist(): Promise<void> {
-    await mkdir(dirname(this.statePath), { recursive: true });
     const records = [...this.records.entries()].map(([key, value]) => {
       const [agentId, version] = key.split('@', 2);
       return { agentId, version, packagePath: value.packagePath, entryCommand: value.entryCommand };
     });
-    await writeFile(this.statePath, `${JSON.stringify(records, null, 2)}\n`, 'utf8');
+    const write=async()=>{
+      await mkdir(dirname(this.statePath), { recursive:true });
+      const temp=this.statePath+'.next';
+      await writeFile(temp,JSON.stringify(records,null,2)+'\n',{mode:0o600});
+      await rename(temp,this.statePath);
+    };
+    this.writes=this.writes.then(write,write);
+    await this.writes;
   }
 }
 

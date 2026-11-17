@@ -111,7 +111,7 @@ export function normalizeTaskPlan(input: unknown): TaskPlan {
 }
 
 /** Checks that an otherwise-valid plan cannot grant a node material from another task. */
-export function validateTaskInputBindings(plan: TaskPlan, allowedInputIds: readonly string[]): void {
+export function validateTaskInputBindings(plan: TaskPlan, allowedInputIds: readonly string[], requiredInputIds:readonly string[]=allowedInputIds): void {
   const allowed = new Set(allowedInputIds);
   const granted = new Set<string>();
   for (const node of plan.nodes) {
@@ -125,7 +125,7 @@ export function validateTaskInputBindings(plan: TaskPlan, allowedInputIds: reado
       granted.add(binding.inputId);
     }
   }
-  for (const inputId of allowed) {
+  for (const inputId of requiredInputIds) {
     if (!granted.has(inputId)) throw new TaskPlanValidationError(`Task input ${inputId} was provided with the requirement but is not granted to any agent node.`);
   }
 }

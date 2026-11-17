@@ -1,4 +1,5 @@
 import type { WorkflowStage } from './workflow';
+import { currentTaskNodes, presentDelivery, type DeliveryDetail, type PresentedAnswer, type PresentedArtifact } from './delivery-presenter';
 
 type Row = Record<string, unknown>;
 
@@ -41,7 +42,9 @@ export type TaskPresentation = {
   stages: WorkflowStage[];
   nodes: PresentedNode[];
   activities: PresentedActivity[];
-  artifacts: Array<{ id: string; fileName: string; mediaType: string; revision: number; createdAt: string; sizeBytes: number }>;
+  answers: PresentedAnswer[];
+  artifacts: PresentedArtifact[];
+  supportingArtifacts: PresentedArtifact[];
   inputs: Array<{ id: string; displayName: string; originalFilename: string; sourceType: string; mediaType: string; sizeBytes: number; sha256: string; createdAt: string }>;
   interactions: Array<{ id: string; source: string; kind: string; title: string; prompt: string; responseSchema: Row; state: string; requestedAt: string }>;
   quality: { state: string; summary: string; passed?: boolean } | null;
@@ -50,7 +53,7 @@ export type TaskPresentation = {
 };
 
 /** Converts durable relational rows into the concise Chinese operator view. */
-export function presentTask(detail: { task?: Row; planSummary?: unknown; plans?: Row[]; nodes?: Row[]; attempts?: Row[]; events?: Row[]; activities?: Row[]; artifacts?: Row[]; inputs?: Row[]; interactions?: Row[]; workflow?: WorkflowStage[] }, now = Date.now()): TaskPresentation {
+export function presentTask(detail: DeliveryDetail & { attempts?: Row[]; events?: Row[]; activities?: Row[]; inputs?: Row[]; interactions?: Row[]; workflow?: WorkflowStage[] }, now = Date.now()): TaskPresentation {
   const task = detail.task ?? {};
   const planSummary = object(detail.planSummary);
   const plan = object(object((detail.plans ?? [])[0]).plan);
@@ -83,15 +86,16 @@ export function presentTask(detail: { task?: Row; planSummary?: unknown; plans?:
       summary: nodeSummary(capability, output, nodeEvents), artifacts, evidence,
     } satisfies PresentedNode;
   });
-  const qualityNode = nodes.find((node) => node.capability === 'quality.define_and_verify');
-  const qualityOutput = object((detail.nodes ?? []).find((node) => text(node.capability) === 'quality.define_and_verify')?.output);
+  const currentQuality = currentTaskNodes(detail).find((node) => text(node.capability) === 'quality.define_and_verify');
+  const qualityNode = nodes.find((node) => node.id === text(currentQuality?.id));
+  const qualityOutput = object(currentQuality?.output);
   const qualityData = object(qualityOutput.output);
   return {
     title: text(task.goal) || '未命名任务', state: text(task.state) || 'pending', stateLabel: stateName(text(task.state) || 'pending'),
     intent: text(planSummary.intent) || (['cancelled','stopping'].includes(text(task.state)) ? '管理员请求停止任务。' : '正在等待中台完成意图分析。'),
     summary: text(planSummary.summary) || (['cancelled','stopping'].includes(text(task.state)) ? '' : '任务计划尚未生成。'),
     deliverables: array(planSummary.deliverables).map(text).filter(Boolean), risks: array(planSummary.risks).map(text).filter(Boolean),
-    stages: detail.workflow ?? [], nodes, activities, artifacts: (detail.artifacts ?? []).map((item) => object(item)).filter((item) => text(item.id) && text(item.fileName)).map((item) => ({ id: text(item.id), fileName: text(item.fileName), mediaType: text(item.mediaType), revision: Number(item.revision) || 1, createdAt: text(item.createdAt), sizeBytes: Number(item.sizeBytes) || 0 })),
+    stages: detail.workflow ?? [], nodes, activities, ...presentDelivery(detail),
     inputs: (detail.inputs ?? []).map((item) => object(item)).filter((item) => text(item.id) && text(item.displayName)).map((item) => ({ id: text(item.id), displayName: text(item.displayName), originalFilename: text(item.originalFilename), sourceType: text(item.sourceType), mediaType: text(item.mediaType), sizeBytes: Number(item.sizeBytes) || 0, sha256: text(item.sha256), createdAt: text(item.createdAt) })),
     interactions: (detail.interactions ?? []).map(object).filter((item) => text(item.id)).map((item) => ({ id: text(item.id), source: text(item.source), kind: text(item.kind), title: text(item.title), prompt: text(item.prompt), responseSchema: object(item.responseSchema), state: text(item.state), requestedAt: text(item.requestedAt) })),
     quality: qualityNode ? { state: qualityNode.state, summary: text(qualityData.summary) || qualityNode.summary, passed: typeof qualityData.passed === 'boolean' ? qualityData.passed : undefined } : null,

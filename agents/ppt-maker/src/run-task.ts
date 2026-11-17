@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 
 import type { AgentTerminalResult, TaskEnvelope } from '../../../packages/agent-protocol/src/index.js';
 import type { CodexRunner, CodexRuntimeStatus } from '../../../packages/codex-runtime/src/index.js';
@@ -66,8 +66,8 @@ async function fileSnapshot(path: string): Promise<FileSnapshot | undefined> {
 
 async function requireFreshFile(path: string, baseline: FileSnapshot | undefined): Promise<void> {
   const current = await fileSnapshot(path);
-  if (!current) throw new Error(`Codex did not produce required output ${path.split('/').at(-1) ?? path}.`);
+  if (!current) throw new Error(`Codex did not produce required output ${basename(path)}.`);
   if (baseline && current.sha256 === baseline.sha256 && current.size === baseline.size && current.mtimeMs === baseline.mtimeMs) {
-    throw new Error(`Codex did not produce fresh ${path.split('/').at(-1) ?? path}; a prior attempt output remains unchanged.`);
+    throw new Error(`Codex did not produce fresh ${basename(path)}; a prior attempt output remains unchanged.`);
   }
 }

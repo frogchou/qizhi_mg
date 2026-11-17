@@ -14,7 +14,7 @@ import { TaskArtifactService } from '../tasks/task-artifact.service.js';
 import { TaskInteractionService } from '../tasks/task-interaction.service.js';
 import { TaskWorkspaceService } from '../tasks/task-workspace.service.js';
 
-type AttemptRow = { attemptId: string; attemptState: string; leaseToken: string; taskId: string; planId: string; nodeId: string; nodeKey: string; nodeWorkspace: string; attemptNumber: number; leaseExpiresAt: Date | string };
+type AttemptRow = { revisionNumber:number; attemptId: string; attemptState: string; leaseToken: string; taskId: string; planId: string; nodeId: string; nodeKey: string; nodeWorkspace: string; attemptNumber: number; leaseExpiresAt: Date | string };
 type YieldedAgentResult = Extract<AgentResult, { status: 'needs_user_input' }>;
 
 @Injectable()
@@ -57,7 +57,7 @@ export class InstanceResultsService {
 
   private async attempt(instanceId: string): Promise<AttemptRow | undefined> {
     const rows = await this.dataSource.query<AttemptRow[]>(`
-      SELECT a.id AS "attemptId", a.state AS "attemptState", a.lease_token AS "leaseToken", a.lease_expires_at AS "leaseExpiresAt", a.attempt_number AS "attemptNumber", p.id AS "planId", p.task_id AS "taskId", n.id AS "nodeId", n.node_key AS "nodeKey", n.workspace_path AS "nodeWorkspace"
+      SELECT coalesce((p.plan->>'revisionNumber')::integer,0) AS "revisionNumber",a.id AS "attemptId", a.state AS "attemptState", a.lease_token AS "leaseToken", a.lease_expires_at AS "leaseExpiresAt", a.attempt_number AS "attemptNumber", p.id AS "planId", p.task_id AS "taskId", n.id AS "nodeId", n.node_key AS "nodeKey", n.workspace_path AS "nodeWorkspace"
       FROM task_attempts a JOIN task_nodes n ON n.id=a.task_node_id JOIN task_plans p ON p.id=n.plan_id WHERE a.instance_id=$1
     `, [instanceId]);
     return rows[0];
@@ -84,7 +84,7 @@ export class InstanceResultsService {
 
   private async acceptYielded(row: AttemptRow, result: YieldedAgentResult): Promise<{ accepted: true; taskId: string }> {
     const content = await this.verifyCheckpoint(row.nodeWorkspace, result.checkpoint);
-    const sealed = await this.workspaces.writeNodeCheckpoint(row.taskId, row.nodeKey, result.checkpoint.resumeKey, content);
+    const sealed = await this.workspaces.writeNodeCheckpoint(row.taskId, row.nodeKey, result.checkpoint.resumeKey, content,row.revisionNumber);
     const checkpoint: InteractionCheckpoint = { ...result.checkpoint, ...sealed };
     const persistedResult: YieldedAgentResult = { ...result, checkpoint };
     await mkdir(row.nodeWorkspace, { recursive: true });

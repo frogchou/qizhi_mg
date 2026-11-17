@@ -21,6 +21,11 @@ export class ControlService {
 
   public async syncReadyVersion(record: ReadyPackageRecord): Promise<void> { await this.dependencies.catalog.upsertReady(record); }
 
+  public async revokeVersion(agentId:string,version:string) {
+    if(!this.dependencies.catalog.revoke)throw new Error('Catalog does not support revoke');
+    await this.dependencies.catalog.revoke(agentId,version);
+  }
+
   public async stopInstance(instanceId: string): Promise<void> {
     await this.dependencies.supervisor.stop(instanceId);
     this.log('instance_stop_requested', { instanceId });

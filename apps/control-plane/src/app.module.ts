@@ -4,6 +4,9 @@ import type { DataSource } from 'typeorm';
 
 import { CodexCliRunner, type CodexRunner } from '../../../packages/codex-runtime/src/index.js';
 import { ADMIN_TOKEN_HASH, AdminAuthGuard } from './config/auth.guard.js';
+import { FactoryController } from './factory/factory.controller.js';
+import { FactoryService } from './factory/factory.service.js';
+import { FactoryReleaseController } from './registry/factory-releases.controller.js';
 import { InstanceEventsController } from './internal/instance-events.controller.js';
 import { InstanceEventsService } from './internal/instance-events.service.js';
 import { InstanceResultsController } from './internal/instance-results.controller.js';
@@ -39,8 +42,9 @@ export class AppModule {
   public static register(options: AppModuleOptions): DynamicModule {
     return {
       module: AppModule,
-      controllers: [RegistryController, InstanceEventsController, InstanceResultsController, TasksController, TaskInputsController, TaskEventStreamController],
+      controllers: [RegistryController, FactoryReleaseController, FactoryController, InstanceEventsController, InstanceResultsController, TasksController, TaskInputsController, TaskEventStreamController],
       providers: [
+        FactoryService,
         { provide: CONTROL_PLANE_DATA_SOURCE, useValue: options.dataSource },
         { provide: NODE_MANAGER_CLIENT, useValue: options.nodeManager },
         { provide: OperationalLogger, useFactory: () => new OperationalLogger(), inject: [] },

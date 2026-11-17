@@ -34,4 +34,11 @@ export class HttpNodeManagerClient implements NodeManagerClient {
     });
     if (!response.ok) throw new Error(`Node manager instance stop failed with HTTP ${response.status}.`);
   }
+
+  public async revokeVersion(agentId:string,version:string) {
+    const response=await this.fetchImpl(`${this.baseUrl}/internal/v1/catalog/revoke`,{
+      method:'POST',headers:{'Content-Type':'application/json','X-MG-Internal-Token':this.token},body:JSON.stringify({agentId,version}),signal:AbortSignal.timeout(10_000),
+    });
+    if(!response.ok)throw new Error(`节点管理服务移除就绪版本失败 (HTTP ${response.status})`);
+  }
 }

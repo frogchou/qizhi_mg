@@ -61,3 +61,24 @@ PPT 智能体在启动时记录现有 PPT 和自检报告的文件指纹；调�
 - 这一策略与质量验收的单次返工独立：前者解决“实例没有活着”，后者解决“交付物质量未通过”。
 
 在调度侧，活动流也区分 `agent_launch_requested` 与 `agent_launch_accepted`；后者仍会提示“等待首次心跳”，不会把“中台已创建 systemd 单元”伪装成“智能体已经运行”。
+## 工厂内停止工单
+
+### 工厂输入资料的来源
+
+`POST /v1/task-inputs/uploads` 接收一个名为 `file` 的 multipart 文件。普通上传默认登记为 `uploaded_file`。栖知发送资料筐快照时同时提供 `X-Qizhi-Source-Type`（qizhi_local_file、ragflow_chunk 或 ragflow_document）和 `X-Qizhi-Basket-Id`（条目 UUID）。中台校验这两个字段后存储文件字节及摘要，冻结到工单后在输入清单保留来源。条目标识仅用于追溯，即使稍后清空桌面资料筐，工单仍可读取自己保存的快照。新建任务及人工补充使用的 `inputIds` 均为暂存上传返回的 id。
+
+任务详情在接收、规划、运行或等待处理期间提供「停止工单」。管理员确认后，客户端请求 `POST /v1/tasks/:taskId/stop`。中台先将状态改为 `stopping`、中断该工单的规划和验收、撤销其节点执行，并在节点管理器确认后返回 `cancelled`。停止状态持久化；重复请求可继续未完成的停止操作，已停止的工单返回相同结果。已结束工单返回 409 `task_already_finished`，执行单元尚未确认退出时返回 409 `task_stop_pending`。两种结果均可从工单详情核实。中台进行验收时，执行时间线的 `acceptance_progress` 活动记录当前环节及其运行时长，便于区分检索等待和结果复核。
+# 同单人工退回与补充
+
+交付正文、文件与过程附件的统一展示约定见 [DELIVERY_CONTENT.md](./DELIVERY_CONTENT.md)。完整 `output.answer` 优先于执行摘要；历史审阅结果中的详细分析会恢复为可阅读正文。
+
+在 `awaiting_review` 工单上使用 `POST /v1/tasks/:id/review`。原有 accept、rework 和 supplement 的行为继续可用。新决定 revise 表示退回重新制作，amend 表示补充需求。两种决定均在同一工单上使用生产规划器重新编排，完成后交回人工验收。
+
+- 请求头 `Idempotency-Key` 必填，可用 1 到 160 位字母、数字、句点、横线或下划线。网络中断后重试同一内容时沿用它。服务返回原始受理回执，实际进度由工单详情呈现。
+- JSON 可包含 `message`（最多 4000 字）、`inputIds`（现有上传接口返回的暂存标识）和 `reviewId`。amend 至少需要文字或一个附件。revise 允许只提交决定。详情的 `currentReviewId` 非空时必须原样带回；历史待审工单没有对应验收轮次时省略此字段。
+- 成功返回 `{taskId,state:"planning",decision,revisionId,revisionNumber,reviewId,inputIds}`。此时 inputIds 已是冻结后的任务资料标识。附件保留原来源和校验摘要，规划必须把冻结资料显式绑定给工作节点。
+- 状态或验收轮次已变化时返回 HTTP 409 和 `stale_review`。同一幂等键改用于其他消息、文件或决定时返回 409 和 `idempotency_conflict`。无效的修订请求返回 400；资料过期、已消费及超出任务限额时返回相应附件错误，事务回滚后工单仍可处理。
+
+修订与消费附件在同一数据库事务中提交。第一轮即使只有直接文字答复、没有验收记录，也能进入新计划。新轮工作目录按修订号隔离，只调度当前计划的节点，归档制品仍沿用原工单下载地址。详情中 revisions、plans、acceptanceRounds、nodes 和 artifacts 保留历次记录。活动账本记录 human_revision_requested 或 human_amendment_requested。停止操作继续作用于原工单，服务重启后从持久化的 planning 状态恢复，规划或验收异常通过已有工单状态和活动报告。
+
+退回或补充时，控制面从上一计划每个节点、每个交付路径选择最新归档版本，验证工单归属、归档目录和 SHA-256，将其登记为 agent_artifact 私有资料。接口返回的 previousDelivery.artifacts 关联原制品 ID、校验值和可绑定的 inputId。规划器可以把这些资料显式授权给支持相应格式的工作节点；调度时再次校验节点本地拷贝。用户本轮上传的资料仍需逐一绑定。纯文本上版答复同时从节点 output.text、answer、summary 或 message 保留，供兼容的旧文字能力生成修订简报。历史资料引用不会挤占用户上传文件配额。

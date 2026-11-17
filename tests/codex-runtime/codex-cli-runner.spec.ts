@@ -12,6 +12,20 @@ afterEach(async () => {
 });
 
 describe.runIf(process.platform === 'linux')('CodexCliRunner', () => {
+  it('delivers a large attachment prompt in full via stdin', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mg-large-prompt-'));
+    roots.push(root);
+    const command = join(root, 'fake-codex');
+    await writeFile(command, `#!/usr/bin/env node
+const fs=require('node:fs');
+const args=process.argv.slice(2);
+if(args.at(-1)!=='-')process.exit(7);
+const prompt=fs.readFileSync(0,'utf8');
+fs.writeFileSync(args[args.indexOf('--output-last-message')+1],prompt);
+`, {mode:0o700});
+    const prompt = '附件资料'.repeat(18_000) + '\n原始记录结束';
+    await expect(new CodexCliRunner({command}).run({workspacePath:root,prompt})).resolves.toEqual({lastMessage:prompt});
+  });
   it('terminates a planning subprocess together with its wrapper on abort', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mg-cancel-planner-'));
     roots.push(root);
