@@ -14,6 +14,78 @@
 
 任务以 PostgreSQL 保存状态，在 `/home/middleground/data/workspaces/<task-id>/` 保存私有资料、会话和产物。明确的能力咨询可以直接从已就绪目录得到答复。需要用户补充信息的工作可以挂起，回答后从原节点继续。
 
+## 架构图
+
+```mermaid
+flowchart TB
+  subgraph Entry[栖知与企业入口]
+    Desktop[栖知桌面客户端\n需求、资料筐、智能工厂]
+    Console[运维控制台 / API]
+    Channels[邮件、飞书、微信、企业系统等渠道]
+  end
+
+  subgraph Control[企业智能体中台 · 控制平面]
+    Intake[需求接收与任务工作区]
+    Registry[智能体注册、审核与版本目录]
+    Planner[Codex 意图分析与 DAG 编译]
+    Scheduler[任务调度、租约、恢复与验收]
+    Audit[审计、活动账本、SSE 与运行日志]
+    Intake --> Planner --> Scheduler
+    Registry --> Planner
+    Scheduler --> Audit
+  end
+
+  subgraph Execution[节点管理与智能体群]
+    NodeManager[节点管理器\n审核命令、systemd 生命周期]
+    AgentA[知识检索智能体]
+    AgentB[PPT / 文本制作智能体]
+    AgentC[互联网研究 / 质量管理智能体]
+    NodeManager --> AgentA
+    NodeManager --> AgentB
+    NodeManager --> AgentC
+  end
+
+  subgraph Runtime[运行时与企业资产]
+    Codex[本机 Codex CLI]
+    Native[Native / 本地工具]
+    RAG[RAGFlow 知识库]
+    Data[记忆、数据库、文件与第三方系统]
+  end
+
+  Desktop -->|HTTP + SSE| Intake
+  Console -->|HTTP + SSE| Intake
+  Channels --> Intake
+  Scheduler -->|仅启动已审核版本| NodeManager
+  AgentA <--> RAG
+  AgentA <--> Data
+  AgentB <--> Codex
+  AgentB <--> Native
+  AgentC <--> Codex
+  AgentC <--> Native
+  AgentA -->|事件、心跳、结果| Audit
+  AgentB -->|事件、心跳、结果| Audit
+  AgentC -->|事件、心跳、结果| Audit
+```
+
+### 从需求到交付
+
+1. 栖知智能工厂、运维控制台或后续的企业渠道提交自然语言需求及已冻结资料；中台为其创建独立任务目录。
+2. 规划器只读取处于 `ready` 状态的审核能力目录，调用 Codex 生成任务 DAG；协议编译器再校验能力、输入、依赖与资料绑定。
+3. 调度器把每个可运行节点绑定到精确的智能体版本，节点管理器以独立 systemd 单元拉起实例。
+4. 智能体直接使用被授权的任务本地资料和所需运行时，持续回传进度、心跳、受限输出、检查点和最终结果。
+5. 中台复核租约、结果、相对工件路径与 SHA-256；合格结果进入下游节点、质量验收或成果归档，并经 SSE 回到栖知智能工厂。
+
+## 栖知智能工厂
+
+栖知桌面客户端 [`qizhi`](https://github.com/frogchou/qizhi) 是中台的面向业务人员的操作界面。它以需求接待大厅、智能体中台、生产线、质检中心、企业资产仓、运行时支撑、运行监控和成果交付八个园区区域呈现真实工单与系统状态。
+
+- 默认全厂总览用于发现工作中、阻塞、待人工验收和已交付事项；
+- 点击建筑进入悬浮抽屉，不缩小园区画面，可查看该区域的实时数据与操作；
+- 工单详情展示已编译 DAG、节点依赖、具体智能体版本、心跳、实时输出、交付内容和可下载工件；
+- 桌面端提供离线演示模式；实时模式通过 HTTP 与 SSE 对接本服务。
+
+桌面端截图、配置说明和资料筐流转说明见 [`qizhi` 的智能工厂介绍](https://github.com/frogchou/qizhi#智能工厂)。
+
 ## 在 Linux 上运行
 
 当前实现面向单机 Linux 和 systemd，开发环境使用 Node.js 22、pnpm 10.26.1、Docker Compose 与 PostgreSQL 16。规划及使用 Codex 的智能体需要在服务账号下安装并登录 Codex CLI；知识检索连接已有的 RAGFlow 服务。
@@ -51,6 +123,7 @@ curl --fail-with-body http://127.0.0.1:3010/v1/tasks \
 
 ## 开发与运维文档
 
+- [智能体管理与开发总览](docs/AGENT_MANAGEMENT_AND_DEVELOPMENT_GUIDE.md) · 包生命周期、审批、调度、协议与开发原则
 - [编写、登记与编排智能体](docs/runbooks/agent-orchestration.md) · [运行时](packages/agent-runtime/README.md)
 - [任务私有附件](docs/runbooks/task-private-inputs.md) · [人工交互与恢复](docs/runbooks/task-human-interaction.md)
 - [监控与排障](docs/runbooks/task-observability.md) · [停止任务](docs/runbooks/task-intent-and-stop.md)

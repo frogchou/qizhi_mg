@@ -22,9 +22,14 @@
 
 ## 项目位置与运行
 
-同一栖知代码库中的 `apps/desktop` 负责客户端，`server` 是完整服务端工作区，包含控制平面、节点管理器、智能体、协议、迁移和原有运维控制台。两个工作区保留各自已锁定的 pnpm 版本。进入对应目录安装依赖，桌面按自己的方式构建；服务端从 `server` 运行 `corepack pnpm typecheck`、`corepack pnpm console:build` 和 `corepack pnpm test`。数据库测试须提供独立可丢弃的 `TEST_DATABASE_URL`。配置清单位于 `infra/env`，依赖数据库、系统服务的设置见服务端 README 及 `infra`。
+栖知桌面客户端和企业智能体中台已拆分为两个独立仓库：
 
-219 延用 `/home/middleground/.worktrees/control-plane-ragflow-v1`、现有 systemd 服务名和现有数据目录。数据库里已审批的包与历史工单保存了绝对路径，发布时应把 `server/` 的内容放入现行部署目录。发布后由控制平面运行增量迁移，并同步节点管理器的就绪目录。运维网页保留在 `/console/`。
+- [`qizhi`](https://github.com/frogchou/qizhi) 的 `apps/desktop` 负责 Windows 客户端、资料筐、知识库和智能工厂界面；
+- 当前仓库 `qizhi_mg` 负责控制平面、节点管理器、智能体、协议、迁移和运维控制台。
+
+两个工作区各自保持锁定的 pnpm 版本并独立安装依赖。服务端在 `qizhi_mg` 仓库根目录运行 `corepack pnpm run typecheck`、`corepack pnpm run console:build` 和 `corepack pnpm test`。数据库测试必须提供专用、可丢弃的 `TEST_DATABASE_URL`。配置清单位于 `infra/env`，依赖数据库和 systemd 的设置见本仓库 README 与 `infra/`。
+
+219 服务器部署时，systemd 的 `WorkingDirectory`、`ExecStart`、环境文件中的 `MG_AGENT_PACKAGE_ROOT` 都必须指向实际的 `qizhi_mg` 检出目录，不能再引用桌面仓库曾使用的 `server/` 路径。历史数据库记录可能保留绝对包路径；迁移前应核对部署路径和现有包目录。发布后，控制平面会执行增量迁移并同步节点管理器的就绪目录；运维网页保持在 `/console/`。
 
 ## 数据与接口边界
 
